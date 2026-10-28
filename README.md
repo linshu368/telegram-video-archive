@@ -1,36 +1,39 @@
 # Telegram 短剧处理
 
-从已确认的 Telegram 来源收集视频信息，先按整部剧筛选，再交给现有下载、校验、上传和 AI 信息补全流程。代码按用途分组；下载通道按整部剧推进，剧内共享全局视频并发。视频下载、校验、上传和缓存清理内核保持原实现。
+从已确认的 Telegram 来源收集完整视频信息，按整部剧筛选、下载补齐与验收，再为合格剧生成 AI 信息并写回数据库，完成实际存在的后处理任务后封存。代码按用途分组，剧内共享全局视频并发；视频下载、校验、上传和缓存清理沿用现有内核。
 
 ## 从哪里开始
 
 | 要做的事 | 入口 |
 |---|---|
 | 登录、确认来源、收集源视频信息 | `archive.py` |
-| 查看筛选结果、运行现有归档与 AI 流程 | `pipeline.py` |
+| 一次运行完整流程，或查看计划、处理池与分阶段操作 | `pipeline.py` |
 | 单独采集或检查 Telegram 话题元数据 | `topic_metadata.py` |
 | 找到具体代码或辅助脚本 | [项目结构](docs/STRUCTURE.md) |
 | 查看参数、质量标准和运行边界 | [流程与操作](docs/PIPELINE.md) |
 
 三个根目录入口保留原命令和参数，实际实现已按职责放进 `video_archive/`。
 
-## 当前流程：先筛选，再按整剧下载
+## 当前流程：一个 `run` 完成全链路
 
-以下命令均从仓库根目录执行，并使用已安装依赖的 Python 环境。完成既有登录与来源白名单确认后，按顺序执行：
+以下命令均从仓库根目录执行，并使用已安装依赖的 Python 环境。完成既有 Telegram 登录、来源白名单及数据库、存储、AI 配置后执行：
 
 ```sh
-# 仅获取信息，不下载视频或封面
-python archive.py scan
-
-# 离线判断整部剧，保存每部剧的结论与完整成员清单
-python pipeline.py plan --minimum-quality 720 --report archive/drama-quality-plan.json
+python pipeline.py run --drama-concurrency 2 --concurrency 4
 ```
+
+默认依次进行：**完整源元数据扫描 → 整剧画质筛选 → 按剧下载补齐、上传验收 → 合格剧 AI 生成并事务回写 → 处理已有 faststart 待办 → 适用阶段完成后封存**。源扫描只读取信息，不下载视频或封面。faststart 仅处理已有待办；新视频没有转码任务时算不适用，不会新增转换任务。需要复用已有有效完整扫描时，显式使用 `run --skip-scan`。
 
 一部剧以 Telegram 原始话题在扫描边界内可访问的全部视频为准。信息不完整的剧暂缓；包含横屏或方屏的剧排除；其余按既定分辨率和码率标准判断。合格剧的成员完整保留，少量画质异常只影响评分。具体规则见 [整剧筛选说明](docs/PIPELINE.md)。
 
-`plan/batch/run/retry/repair` 都经过同一筛选关口。确认计划后，可限制本次只处理一部剧：
+手动检查或分阶段操作仍可使用：
 
 ```sh
+# 仅扫描源信息
+python archive.py scan
+# 纯离线质量预览，不读取已处理池或云端
+python pipeline.py plan --minimum-quality 720 --report archive/drama-quality-plan.json
+# 只处理一部剧的下载与验收阶段
 python pipeline.py batch --drama-limit 1 --minimum-quality 720
 ```
 
@@ -46,7 +49,20 @@ python pipeline.py repair
 
 `repair` 根据完整源清单和已验证的云端提交重算缺口，续传 partial，只补缺失；已齐的剧无需重下载。完整清单、逐视频失败及重试历史和最终结果持续保留，结果存于 `archive/pipeline/projects/<project_ref>/drama-outcomes.json`。后续 AI/转码只接收已判定通过且与当前清单一致的剧。验证完成不要求整剧同时保存在本地缓存，也不会因为剧被拒绝而主动删除已上传的云端对象。
 
-`--only/--first` 指定任一集会扩展到整部剧；`--limit` 是视频数量软目标，当前剧完整纳入后才停止接新剧；`--drama-limit` 直接限制剧数。旧 `archive.py sample/backfill/resume/retry` 保留本地归档用途，不套用新筛选和整剧调度。
+## 已处理池：避免重复判断和重复付费
+
+当前项目的持久池位于 `archive/pipeline/projects/<project_ref>/processed-dramas.json`。明确画质拒绝（`screening_rejected`）、下载最终拒绝（`download_rejected`）、全阶段完成（`completed`）三类结果入池；临时断网、信息不足、预算或大小限制暂缓、AI 失败、封面或封装待完成不入池，下次沿已有进度继续。已提交成功的 AI 任务会复用，不重复生成。`completed` 要求下载验收、AI 提交、封面完成或无缩略图，以及实际存在的后处理任务全部完成；没有转码任务不会一直待定。
+
+查看处理池或手动解除跳过：
+
+```sh
+python pipeline.py processed
+python pipeline.py reopen --drama-id UUID
+```
+
+将 `UUID` 换成处理池中的剧 ID，可一次提供多个 ID。池子按来源和原话题识别剧：入池后，该话题即使新增视频也默认跳过，需要 `reopen` 才重新纳入。解除只移除跳过标记，不清空数据库尝试次数、不重置已成功 AI 任务。默认源扫描仍完整发现话题；`run/batch/retry/repair/ai/transcode-backlog` 在处理前排除池内剧。`plan` 仍是纯离线源质量预览，不依赖处理池或云端。
+
+`--only/--first` 指定任一集会扩展到整部剧；`--limit` 是视频数量软目标，当前剧完整纳入后才停止接新剧；`--drama-limit` 直接限制剧数。旧 `archive.py sample/backfill/resume/retry` 保留本地归档用途，不套用新筛选和整剧调度。本轮只实现和测试这些流程，没有执行真实 Telegram 运行或付费 AI 调用。
 
 ## 目录
 

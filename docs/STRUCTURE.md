@@ -9,7 +9,7 @@
 | 根目录入口 | 实际实现 | 用途 |
 |---|---|---|
 | `archive.py` | `video_archive/telegram/archive.py` | 登录、确认来源、源信息扫描及原本地归档 |
-| `pipeline.py` | `video_archive/pipeline/runner.py` | 离线计划、归档、迁移、存储检查、AI 和转码入口 |
+| `pipeline.py` | `video_archive/pipeline/runner.py` | `run` 全链路、计划、归档、AI、封装与处理池管理入口 |
 | `topic_metadata.py` | `video_archive/telegram/topics.py` | 独立话题目录和消息元数据采集 |
 
 原来的 `python archive.py ...`、`python pipeline.py ...`、`python topic_metadata.py ...` 命令继续可用。根入口只负责转交调用，业务实现集中在下面的目录。
@@ -30,7 +30,9 @@ python topic_metadata.py --help
 | `telegram/topics.py` | 话题目录、分页采集、消息归属与采集审计 |
 | `screening/inventory.py` | 从源话题收齐视频成员及完整性证据 |
 | `screening/quality.py` | 用完整成员清单判断方向、分辨率、码率和整剧画质档位 |
-| `pipeline/runner.py` | 主流程命令和现有任务接线 |
+| `pipeline/runner.py` | CLI 入口与完整主流程接线 |
+| `pipeline/workflow.py` | 复用源扫描、下载交付与 AI/封装阶段，核对全阶段完成状态 |
+| `pipeline/processed.py` | 项目隔离的已处理池、来源/话题跳过与手动解除 |
 | `pipeline/common.py` | 配置校验、稳定身份、快照、通用错误与数据转换 |
 | `pipeline/batch.py` | 整剧计划、剧通道、全局视频并发、分段、补齐和最终判定 |
 | `pipeline/completion.py` | 源视频清单、逐集收据核对、缺集判定和中断报告恢复 |
@@ -41,7 +43,11 @@ python topic_metadata.py --help
 | `pipeline/ai.py` | 抽帧、模型调用、提示词和用量记录 |
 | `pipeline/transcode.py` | 现有转码处理 |
 
-主流程是：**收齐源话题信息 → 整剧画质筛选 → 合格剧整组计划 → 每个剧通道完成传输、补齐及判定 → 通过的剧进入原 AI 与转码处理**。画质筛选始终保留合格剧的全部成员，少量低质异常只影响评分。
+默认 `run` 流程是：**完整源元数据扫描 → 按来源/话题过滤已处理池 → 整剧画质筛选 → 按剧下载补齐、上传验收 → 合格剧 AI 生成并事务回写 → 处理已有 faststart 待办 → 适用阶段完成后封存**。扫描不下载媒体；`--skip-scan` 显式复用已有有效完整扫描。AI 之后只处理现存 faststart 待办，不为没有转码任务的新视频新增转换任务。画质筛选保留合格剧的全部成员，少量低质异常只影响评分。
+
+```sh
+python pipeline.py run --drama-concurrency 2 --concurrency 4
+```
 
 下载计划、执行和重试统一使用整剧流程。每个剧通道占用至该剧传输、有界重试和最终判定结束，不能中途换剧。`--drama-concurrency` 默认 1，允许多个剧通道；`--concurrency` 默认 4，仍是全部通道共享的视频任务上限，不相乘。单段默认 100、最多 500 个视频。
 
@@ -102,12 +108,22 @@ python scripts/validation/validate_implementation.py
 | `prompts/prompt.md` | 原 AI 系统提示词，内容不变 |
 | `.private/` | 原本机凭证、会话、白名单、真实配置与锁，位置不变，不提交 |
 | `archive/` | 扫描状态、完整清单、逐视频报告、下载文件和缓存，位置不变，不提交 |
-| `archive/pipeline/projects/<project_ref>/drama-outcomes.json` | 持久化整剧最终判定；AI/转码核对通过状态和清单一致性 |
+| `archive/pipeline/projects/<project_ref>/drama-outcomes.json` | 持久化整剧下载验收判定；AI/封装核对通过状态和清单一致性 |
+| `archive/pipeline/projects/<project_ref>/processed-dramas.json` | 项目隔离的已处理池：明确画质拒绝、下载最终拒绝或全阶段完成后默认跳过 |
 | `migrations/` | 原 SQL 迁移，文件内容和执行顺序不变 |
 | `tests/` | 原回归测试及整剧调度检查 |
 | `requirements.lock` | 原依赖版本锁定文件 |
 
-拒绝或 `pending` 的剧不进入后续 AI 或转码，已上传的云端对象不会因此被主动删除。`ai` 和 `transcode-backlog` 读取持久化结果，只选择已经判定通过且与当前完整清单一致的剧；从未评定的旧数据先运行 `repair` 审计。
+拒绝或 `pending` 的剧不进入后续 AI 或转码，已上传的云端对象不会因此被主动删除。`ai` 和 `transcode-backlog` 继续作为分阶段入口，只处理通过下载验收且与当前完整清单一致的剧；从未评定的旧数据先运行 `repair` 审计。
+
+已处理池记录 `screening_rejected`、`download_rejected`、`completed`。`completed` 要求下载验收通过、AI 事务提交、已下载视频封面完成或无缩略图，以及实际存在的后处理任务全部完成；没有转码任务按不适用处理。临时失败和待完成阶段不入池，下次按进度继续；成功 AI 任务不会因重复运行或解除跳过而再次付费生成。
+
+```sh
+python pipeline.py processed
+python pipeline.py reopen --drama-id UUID
+```
+
+将 `UUID` 替换为实际剧 ID，可提供多个 ID。`run/batch/retry/repair/ai/transcode-backlog` 按池排除已处理剧；`plan` 只做离线源质量预览，不读取处理池或云端。处理池按来源和话题保持跳过，即使同话题新增视频也不自动重新处理；`reopen` 只解除跳过，不重置数据库尝试次数或 AI 成功状态。
 
 配置模板和提示词只移动位置，没有修改内容。三个日常入口仍以项目根目录定位 `.private/` 和 `archive/`，从其他工作目录使用绝对入口路径也不会把它们写到源码目录。
 

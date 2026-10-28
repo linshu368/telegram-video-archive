@@ -2,18 +2,41 @@
 
 当前目录与脚本位置见 [项目结构](STRUCTURE.md)。代码按用途分组，下载队列按整剧推进；视频下载、上传、校验和缓存清理内核保持原实现。下文历史记录中的旧机器路径和运行事实不改写。
 
-## 源整剧下载前筛选（2026-10-28，当前入口）
+## 完整主流程与整剧处理（2026-10-28，当前入口）
 
-当前在 `plan/batch/run/retry/repair` 前执行整剧筛选，并以整部剧为单位计划和推进下载。剧的完整成员以 **Telegram 原始话题在冻结边界内、当前 API 可访问的全部视频**为准，生产库、本地视频池和旧 `topics.json` 不决定剧清单。旧的数量与留存率需要重新扫描后计算。本轮没有执行真实源扫描、生产下载或部署；下文带日期的授权、运行状态和验收数量是历史记录。
+默认 `run` 串联完整源扫描、整剧筛选、下载补齐验收、合格剧 AI 生成与事务回写、已有 faststart 待办和最终封存。`plan/batch/retry/repair/ai/transcode-backlog` 保留为分阶段入口。剧的完整成员以 **Telegram 原始话题在冻结边界内、当前 API 可访问的全部视频**为准，生产库、本地视频池和旧 `topics.json` 不决定剧清单。旧的数量与留存率需要重新扫描后计算。本轮没有执行真实源扫描、生产下载或部署；下文带日期的授权、运行状态和验收数量是历史记录。
 
-### 先收齐源信息，再离线评估
+### 默认 `run` 全链路
 
-使用既有登录、来源白名单和同一数据目录；如尚未配置，先按 README 完成 `login` 与 `resolve --confirm`。以下命令均从仓库根目录执行，并使用已安装项目依赖的 Python 环境：
+使用既有 Telegram 登录、来源白名单、数据库、存储和 AI 配置。以下命令均从仓库根目录执行，并使用已安装项目依赖的 Python 环境：
+
+```sh
+python pipeline.py run --drama-concurrency 2 --concurrency 4
+```
+
+`run` 默认完成以下步骤：
+
+1. 完整源元数据扫描，只发现话题和成员，不下载媒体。
+2. 按当前项目的已处理池排除已封存来源/话题，再执行整剧画质硬筛。
+3. 合格剧进入剧通道，完成下载、上传、读回、有界补齐和最终下载验收。
+4. 下载验收通过的剧生成 AI 标题、标签和简介，通过现有事务接口写回数据库；已经成功提交的 AI 任务直接复用。
+5. AI 之后沿用现有逻辑处理历史 faststart 待办，完成后提交状态。新视频没有转码任务时按“不适用”处理，不新增转换任务；视频封面仍须完成或明确无缩略图。
+6. AI、封面和实际存在的后处理任务全部完成后，将剧写入已处理池，之后默认跳过。没有转码任务不会让剧一直待定。
+
+显式复用已有有效完整源扫描：
+
+```sh
+python pipeline.py run --skip-scan --drama-concurrency 2 --concurrency 4
+```
+
+`--skip-scan` 只省略本次扫描，不能绕过源完整性证据。没有有效完整扫描时仍停止。`plan` 仍是纯离线源质量预览，只读完整本地源快照，不读取已处理池、不查云端。手动扫描、分阶段下载、补齐、AI 和已有封装待办入口继续保留，例如：
 
 ```sh
 python archive.py scan
 python pipeline.py plan --minimum-quality 720 --report archive/drama-quality-plan.json
 ```
+
+### 源完整性与整剧筛选前提
 
 `archive.py scan` 是纯元数据入口：
 
@@ -46,7 +69,7 @@ python pipeline.py plan --minimum-quality 720 --report archive/drama-quality-pla
 
 默认最低要求是近 720 档，`--minimum-quality 480/720/1080` 可切换最低档。码率优先使用有效元数据；没有现成码率时按 `expected_size × 8 / duration_seconds` 估算平均 bps，再按 `bps × (720 × 1280) / (width × height) / 1,000,000` 换算等效 Mbps。已有已验证的本地探测结果可以补齐缺失声明字段，源声明字段优先。该值包含容器与音频等开销，是压缩程度的近似信号，不能视为视频流精确码率或感知画质评分；本轮不会为补字段预先下载文件。
 
-报告中 `evaluated_dramas` 是参与评估的有视频源剧数，`quality_decisions` 分别列出合格、拒绝和待补字段的剧数，`accepted_drama_videos` 是所有合格剧的完整视频数。每剧记录保留判定原因、档位、方法、缺字段数及完整 `expected_message_ids/expected_video_ids`。`eligible_before_cloud_check` 则是经过原下载条件后本次能进入正常队列的视频数，可能低于合格剧的视频总数；`deferred` 说明文件大小、partial 等延后原因。`plan` 只读本地源快照，不查云端是否已归档，不下载或上传媒体。
+报告中 `evaluated_dramas` 是参与评估的有视频源剧数，`quality_decisions` 分别列出合格、拒绝和待补字段的剧数，`accepted_drama_videos` 是所有合格剧的完整视频数。每剧记录保留判定原因、档位、方法、缺字段数及完整 `expected_message_ids/expected_video_ids`。`eligible_before_cloud_check` 则是经过原下载条件后本次能进入正常队列的视频数，可能低于合格剧的视频总数；`deferred` 说明文件大小、partial 等延后原因。`plan` 只读本地源快照，不读取已处理池、不查云端是否已归档，不下载或上传媒体。执行入口 `run/batch/retry/repair/ai/transcode-backlog` 会按池排除已处理剧。
 
 ### 剧通道、并发与计划
 
@@ -56,7 +79,7 @@ python pipeline.py plan --minimum-quality 720 --report archive/drama-quality-pla
 python pipeline.py batch --drama-limit 1 --minimum-quality 720
 ```
 
-- 每个剧通道从领取当前剧起，持续处理它的所有分段、失败补齐和最终判定，结束后才接下一部剧。不能先换剧，再回头给上一部补齐。
+- 每个剧通道从领取当前剧起，持续处理它的所有下载分段、失败补齐和最终下载判定，结束后才接下一部剧。不能先换剧，再回头给上一部补齐。
 - `--drama-concurrency` 默认 1，可开多个剧通道。`--concurrency` 默认 4，是全部剧通道共享的视频任务上限；两者不相乘。例如两个剧通道、视频并发 4，合计仍最多同时处理 4 个视频任务。
 - `--batch-size` 默认 100，最多 500。大剧可以跨多个分段，分段不改变剧通道的占用范围。
 - `--only` 和 `--first` 中任一消息 ID 都会扩展到所属整剧，质量判断和最终判定始终使用完整源成员。
@@ -107,7 +130,34 @@ python pipeline.py repair
 
 拒绝或待定不会物理删除已经上传的云端对象，本地缓存仍按原验证与清理条件处理。`batch/run/retry/repair` 每次先验证源完整性和画质条件；旧 `archive.py sample/backfill/resume/retry` 保留本地归档用途，不套用新筛选、剧通道或最终缺失率判定。
 
-本次文档整理和离线验证没有运行真实 Telegram 扫描或生产下载。实际源清单、合格数量和下载结果需在配置正确后执行对应命令取得。
+### 已处理池、跳过和手动解除
+
+已处理池与下载验收结果分开保存，并按目标项目隔离：
+
+`archive/pipeline/projects/<project_ref>/processed-dramas.json`
+
+| 池内状态 | 入池条件 |
+|---|---|
+| `screening_rejected` | 整剧画质条件已明确拒绝 |
+| `download_rejected` | 下载补齐已结束，整剧被最终拒绝 |
+| `completed` | 下载验收通过、AI 成功事务提交、已下载视频封面完成或无缩略图，且实际存在的后处理任务全部完成；无转码任务为不适用 |
+
+`complete` / `accepted_with_gaps` 是下载验收结论，不能单独视为完整流程的 `completed`。只有所有后续阶段也完成，才封存为 `completed`。
+
+临时断网、信息不足、预算或大小限制暂缓、AI 失败、封面或已有 faststart 任务待完成不入池，下次沿用已有进度继续。已成功提交的 AI 任务不会在重跑时重新付费生成。源目录扫描仍做完整发现；执行入口在后续画质评估或媒体处理之前按池排除已处理剧，纯离线 `plan` 不受池影响。
+
+池子按来源和原始话题识别剧，不因话题新增视频自动失效：一旦入池，同一话题后续新增视频也默认跳过。需要再次处理时手动解除：
+
+```sh
+python pipeline.py processed
+python pipeline.py reopen --drama-id UUID
+# 一次解除多部剧
+python pipeline.py reopen --drama-id UUID_1 UUID_2
+```
+
+将占位符换成 `processed` 显示的实际剧 UUID。`reopen` 只解除跳过，不清空数据库尝试次数，不重置已成功的 AI 任务，也不删除已上传对象。解除后再运行正常流程，会重新按当前源清单和现有进度判断。
+
+本轮只完成实现与离线测试，没有执行真实 Telegram 扫描、生产下载或付费 AI 调用。实际源清单、合格数量和全流程结果需在配置正确后执行对应命令取得。
 
 ## main 授权与恢复入口历史记录（2026-10-21）
 

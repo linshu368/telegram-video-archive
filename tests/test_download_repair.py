@@ -155,12 +155,17 @@ class DownstreamGateTests(unittest.TestCase):
             db.state.side_effect = receipts.get
             config = {'database_dsn': 'unused', 'project_ref': 'testref'}
             args = ['pipeline.py', '--data', str(root), 'ai']
+            def commit_ai(*args, **kwargs):
+                for receipt in receipts.values():
+                    receipt['tasks']['ai'] = {'status': 'succeeded'}
+                    receipt['ai'] = {'drama_id': did, 'source_video_id': rows[0][1]['id'],
+                                     'title': '剧名', 'tags': [], 'description': None}
             with (patch.object(sys, 'argv', args), patch('video_archive.pipeline.runner.BASE', root),
                   patch('video_archive.pipeline.runner.config', return_value=config),
                   patch('video_archive.pipeline.runner.Database', return_value=db),
                   patch('video_archive.pipeline.runner.Storage', return_value=storage),
                   patch('video_archive.pipeline.runner.Cache'),
-                  patch('video_archive.pipeline.runner.run_ai') as ai,
+                  patch('video_archive.pipeline.runner.run_ai', side_effect=commit_ai) as ai,
                   patch('video_archive.pipeline.ai.build_provider'),
                   contextlib.redirect_stdout(io.StringIO())):
                 self.assertEqual(main(), 0)

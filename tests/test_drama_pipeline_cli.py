@@ -205,7 +205,7 @@ class DramaCliTests(unittest.TestCase):
             config = {'database_dsn': 'unused', 'project_ref': 'testref',
                       'global_file_limit': 128 * 1024**2, 'bucket_file_limit': 128 * 1024**2}
             runner = AsyncMock(return_value={'status': 'all_archived', 'videos': []})
-            args = ['pipeline.py', '--data', str(root), 'run', '--only', '11']
+            args = ['pipeline.py', '--data', str(root), 'run', '--skip-scan', '--only', '11']
             with (patch.object(sys, 'argv', args), patch('video_archive.pipeline.runner.BASE', root),
                   patch('video_archive.pipeline.runner.config', return_value=config),
                   patch('video_archive.pipeline.runner.Database', return_value=db),

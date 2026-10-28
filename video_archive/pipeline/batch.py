@@ -173,10 +173,26 @@ def plan_dramas(rows, root, archived, *, quality_policy, only=(), first=(),
 def retry_plan_dramas(rows, root, report_path, project_ref, *, quality_policy,
                       archived=frozenset(), covered=frozenset(), cover_only=frozenset(),
                       include_deferred=False, max_bytes=128 * 1024**2, bucket_limit=None,
-                      video_limit=None, drama_limit=None):
+                      video_limit=None, drama_limit=None, skip_drama_ids=frozenset(),
+                      skip_message_ids=frozenset()):
     """Expand durable retry candidates to their complete, freshly evaluated dramas."""
     rows = list(rows)
     report = read_pass_report(report_path, project_ref)
+    if skip_drama_ids:
+        # A saved retry report can include dramas deliberately sealed since that pass.
+        # Remove those members before validating the remaining source manifests.
+        skipped = set(skip_message_ids) | {mid for drama in report.get('dramas', [])
+                   if drama.get('drama_id') in skip_drama_ids
+                   for mid in drama.get('expected_message_ids', [])}
+        report['dramas'] = [drama for drama in report.get('dramas', [])
+                            if drama.get('drama_id') not in skip_drama_ids]
+        for part in report.get('segments', [report]):
+            part['videos'] = [entry for entry in part.get('videos', [])
+                              if entry['message_id'] not in skipped]
+        report['pending_message_ids'] = [mid for mid in report.get('pending_message_ids', [])
+                                          if mid not in skipped]
+        report['deferred'] = [entry for entry in report.get('deferred', [])
+                               if entry['message_id'] not in skipped]
     identity_check = validate_retry_manifests(report, rows)
     latest = {entry['message_id']: entry for part in report.get('segments', [report])
               for entry in part.get('videos', [])}
@@ -599,7 +615,7 @@ async def process_drama_pass(db, storage, cache, store, client, peer, source, jo
                              drama_evaluations, batch_size=100, report_path=None,
                              deferred=(), project_ref=None, retry_rounds=0,
                              quality_policy_summary=None, drama_concurrency=1,
-                             max_missing_ratio=.10, outcome_path=None, **options):
+                             max_missing_ratio=.10, outcome_path=None, processed_path=None, **options):
     """Keep each drama in its lane through transfer, repair and final judgment.
 
     A large drama spans bounded segments before the next drama starts. Ordinary
@@ -738,6 +754,9 @@ async def process_drama_pass(db, storage, cache, store, client, peer, source, jo
         if outcome_path is not None:
             from video_archive.pipeline.outcomes import write_outcomes
             write_outcomes(outcome_path, project_ref, evaluations)
+        if processed_path is not None:
+            from video_archive.pipeline.processed import record_evaluations
+            record_evaluations(processed_path, project_ref, evaluations, report_path=report_path)
 
     async def wait_retry():
         if shared_stop.is_set():

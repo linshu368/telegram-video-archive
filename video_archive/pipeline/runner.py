@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Finite archive passes with project-scoped storage state; no daemon or real AI provider."""
+"""Finite whole-drama scanning, delivery and AI enrichment with durable terminal decisions."""
 import argparse
 import asyncio
 import fcntl
@@ -10,7 +10,7 @@ import signal
 import sqlite3
 import sys
 import time
-from contextlib import contextmanager
+from contextlib import ExitStack, contextmanager, nullcontext
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
@@ -365,7 +365,7 @@ def ai_input(db, storage, cache, vid, check):
                 path.unlink(missing_ok=True)
 
 
-def run_ai(db, storage, cache, did, provider, *, allow_test_provider=False):
+def run_ai(db, storage, cache, did, provider, *, allow_test_provider=False, allowed_source_ids=None):
     """did is a drama_id: the result is shared by every video under it, generated
     from just one representative video (the earliest-message_id one already
     uploaded), not every episode aggregated together.
@@ -386,6 +386,8 @@ def run_ai(db, storage, cache, did, provider, *, allow_test_provider=False):
         if not vid:
             raise PipelineError('ai_source_video_missing')
         vid = str(vid)
+        if allowed_source_ids is not None and vid not in allowed_source_ids:
+            raise PipelineError('ai_source_outside_approved_manifest')
         from video_archive.pipeline.ai import usage_subject
         token = usage_subject.set({'drama_id': did, 'video_id': vid})
         try:
@@ -418,7 +420,9 @@ def main():
     parser.add_argument('--config', type=Path, default=BASE / '.private/pipeline.json')
     parser.add_argument('--data', type=Path, default=BASE / 'archive')
     parser.add_argument('--topics', type=Path, default=TOPICS)
-    parser.add_argument('command', choices=['init-config', 'check', 'inventory', 'plan', 'verify-samples', 'migrate', 'bucket', 'import', 'samples', 'batch', 'run', 'retry', 'repair', 'ai', 'transcode-backlog'])
+    parser.add_argument('command', choices=['init-config', 'check', 'inventory', 'plan', 'verify-samples', 'migrate', 'bucket', 'import', 'samples', 'batch', 'run', 'retry', 'repair', 'ai', 'transcode-backlog', 'processed', 'reopen'])
+    parser.add_argument('--skip-scan', action='store_true', help='run: explicitly reuse an existing complete source inventory')
+    parser.add_argument('--drama-id', nargs='+', default=[], help='reopen: remove these drama UUIDs from the processed pool')
     parser.add_argument('--report', type=Path, help='plan: save full decisions; retry: resume a report for this target project')
     parser.add_argument('--migration', help='migrate: one incremental file name under migrations/')
     parser.add_argument('--include-deferred', action='store_true', help='retry: explicitly include deferred with the chosen size threshold')
@@ -445,7 +449,37 @@ def main():
         if value is not None:
             setattr(args, name, cli_path(value))
     os.umask(0o077)
+    resources = ExitStack()
+    early_lock = None
     try:
+        if args.skip_scan and args.command != 'run':
+            raise PipelineError('skip_scan_only_for_run')
+        if args.drama_id and args.command != 'reopen':
+            raise PipelineError('drama_id_only_for_reopen')
+        if args.command in ('run', 'processed', 'reopen'):
+            c = config(args.config)
+            private = BASE / '.private'
+            private.mkdir(mode=0o700, exist_ok=True)
+            early_lock = resources.enter_context((private / f"process-{c['project_ref']}.lock").open('a'))
+            try:
+                fcntl.flock(early_lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except BlockingIOError:
+                raise PipelineError('archive_worker_running') from None
+            from video_archive.pipeline.processed import processed_file, load_pool, reopen
+            pool_path = processed_file(args.data, c['project_ref'])
+            if args.command == 'processed':
+                print(json.dumps(load_pool(pool_path, c['project_ref']), ensure_ascii=False))
+                return 0
+            if args.command == 'reopen':
+                if not args.drama_id:
+                    raise PipelineError('reopen_drama_id_required')
+                result = reopen(pool_path, c['project_ref'], args.drama_id)
+                print(json.dumps({'reopened': result, 'pool': str(pool_path)}, ensure_ascii=False))
+                return 0
+            from video_archive.pipeline.workflow import scan_source, source_session_lock
+            resources.enter_context(source_session_lock())
+            if not args.skip_scan:
+                scan_source(args.data, lock_held=True)
         if args.command == 'init-config':
             args.config.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
             if args.config.parent.stat().st_mode & 0o077 or args.config.parent.is_symlink():
@@ -519,7 +553,7 @@ def main():
             # to run at once. Two workers on the *same* project still serialize.
             c = config(args.config)
             lock_path = private / f"process-{c['project_ref']}.lock"
-        with lock_path.open('a') as lock:
+        with (nullcontext(early_lock) if early_lock is not None else lock_path.open('a')) as lock:
             try:
                 fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
             except BlockingIOError:
@@ -534,6 +568,23 @@ def main():
                 atomic_json(args.data / 'pipeline-local-acceptance.json', report)
                 print(json.dumps({'local_verified': [x['message_id'] for x in results], 'remote_verified': False}))
                 return 0
+            pool_skipped = []
+            skipped_message_ids = set()
+            if args.command in ('batch', 'run', 'retry', 'repair', 'ai', 'transcode-backlog'):
+                from video_archive.pipeline.processed import processed_file
+                from video_archive.pipeline.workflow import unprocessed_selection
+                pool_path = processed_file(args.data, c['project_ref'])
+                original_message_ids = {job[2]['message_id'] for job in rows}
+                rows, pool_skipped, args.only, args.first = unprocessed_selection(
+                    pool_path, c['project_ref'], rows, only=args.only, first=args.first)
+                skipped_message_ids = original_message_ids - {job[2]['message_id'] for job in rows}
+                if not rows and pool_skipped:
+                    print(json.dumps({'status': 'nothing_to_process', 'workflow_status': 'complete',
+                                      'processed_pool_skipped': pool_skipped}, ensure_ascii=False))
+                    return 0
+                if args.command in ('batch', 'retry', 'repair'):
+                    from video_archive.pipeline.workflow import source_session_lock
+                    resources.enter_context(source_session_lock())
             db, storage = Database(c['database_dsn']), Storage(c)
             if args.command == 'samples' and max(r[2]['expected_size'] for r in samples) > min(c['global_file_limit'], c['bucket_file_limit']):
                 raise PipelineError('sample_exceeds_project_limit')
@@ -572,6 +623,8 @@ def main():
                     jobs, deferred, evaluations = retry_plan_dramas(
                         rows, args.data, args.report, c['project_ref'], quality_policy=quality_policy,
                         archived=archived, covered=covered, cover_only=cover_only,
+                        skip_drama_ids={entry['drama_id'] for entry in pool_skipped},
+                        skip_message_ids=skipped_message_ids,
                         include_deferred=args.include_deferred,
                         max_bytes=args.max_video_mib * 1024**2, bucket_limit=storage.limit,
                         video_limit=args.limit, drama_limit=args.drama_limit)
@@ -581,14 +634,22 @@ def main():
                         only=args.only, first=args.first, max_bytes=args.max_video_mib * 1024**2,
                         bucket_limit=storage.limit, covered=covered, cover_only=cover_only,
                         video_limit=args.limit, drama_limit=args.drama_limit,
-                        resume_partials=args.command == 'repair',
+                        resume_partials=args.command in ('run', 'repair'),
                         defer_ids=() if args.command == 'repair' else (3021,),
-                        force_readback=args.command != 'repair')
+                        force_readback=args.command not in ('run', 'repair'))
                 selection_path = args.data / ('pipeline-selection-' + now().replace(':', '-') + '.json')
                 atomic_json(selection_path, {'at': now(), 'project_ref': c['project_ref'],
                                             'inventory_scope': 'complete_source_topics_frozen_boundary',
                                             'quality_policy': quality_policy.to_dict(),
-                                            **drama_selection_summary(evaluations), 'dramas': evaluations})
+                                            **drama_selection_summary(evaluations), 'dramas': evaluations,
+                                            'processed_pool_skipped': pool_skipped})
+                from video_archive.pipeline.processed import record_evaluations
+                record_evaluations(pool_path, c['project_ref'], evaluations, report_path=selection_path)
+                provider = None
+                if args.command == 'run' and jobs:
+                    # Validate local AI settings before spending time transferring new media.
+                    from video_archive.pipeline.ai import build_provider
+                    provider = build_provider()
                 backup_legacy(args.data)
                 gib = 1024 ** 3
                 cache = Cache(args.data, high=args.cache_high_gb * gib, low=args.cache_high_gb * gib * 6 // 10,
@@ -609,13 +670,18 @@ def main():
                                                    retry_rounds=args.retry_rounds,
                                                    drama_concurrency=args.drama_concurrency,
                                                    outcome_path=outcome_file(args.data, c['project_ref']),
-                                                   resume_partials=args.command in ('retry', 'repair'),
+                                                   processed_path=pool_path,
+                                                   resume_partials=args.command in ('run', 'retry', 'repair'),
                                                    project_ref=c['project_ref'], deferred=deferred))
                 finally:
                     store.db.close()
                 report.update(quality_policy=quality_policy.to_dict(),
-                              drama_selection_report=str(selection_path))
+                              drama_selection_report=str(selection_path),
+                              processed_pool_skipped=pool_skipped)
+                record_evaluations(pool_path, c['project_ref'], report.get('dramas', evaluations),
+                                   report_path=path)
                 atomic_json(path, report)
+                ai_report, ai_path, completed = None, None, []
                 transcode_report, transcode_path = None, None
                 # Only after a clean run: a pass that already hit a hard stop
                 # (flood/disk/db) should not take on more network work on top.
@@ -623,12 +689,32 @@ def main():
                     from video_archive.pipeline.batch import drain_transcode, select_ai_candidates
                     selected_rows = filter_approved_rows(
                         outcome_file(args.data, c['project_ref']), c['project_ref'], rows)
+                    from video_archive.pipeline.workflow import process_ai, finalize_processed
+                    ai_path = path.with_name(path.stem + '-ai.json')
+                    report['workflow_status'] = 'enriching'
+                    atomic_json(path, report)
+                    ai_report = process_ai(db, storage, cache, selected_rows, analyze=run_ai,
+                                           provider=provider, report_path=ai_path)
+                    report['ai_called'] = any(entry['result'] == 'ai_succeeded'
+                                              for entry in ai_report['results'])
                     committed, _ = committed_inventory(db, selected_rows)
                     candidates = select_ai_candidates(selected_rows, committed, limit=None)
                     transcode_path = args.data / ('pipeline-transcode-' + now().replace(':', '-') + '.json')
                     transcode_report = asyncio.run(drain_transcode(
                         db, storage, cache, candidates,
                         concurrency=args.transcode_concurrency, report_path=transcode_path))
+                    completed = finalize_processed(db, selected_rows, path=pool_path,
+                                                   project_ref=c['project_ref'], report_path=path)
+                    waiting = any(entry.get('planning_status') in ('pending', 'deferred')
+                                  or (entry.get('decision') == 'accept'
+                                      and entry.get('delivery_accepted') is not True)
+                                  for entry in report.get('dramas', []))
+                    report['workflow_status'] = ('pending' if waiting
+                        or any(entry['result'] != 'completed' for entry in completed)
+                        or ai_report['status'] != 'complete' else 'complete')
+                    report.update(ai_report=str(ai_path), ai_results=ai_report['results'],
+                                  transcode_report=str(transcode_path), processed_results=completed)
+                    atomic_json(path, report)
                 print(json.dumps({'status': report['status'], 'report': str(path),
                                   'drama_selection_report': str(selection_path),
                                   **drama_selection_summary(evaluations),
@@ -645,8 +731,14 @@ def main():
                                              for item in report.get('dramas', [])],
                                   'results': [(x['message_id'], x['result'], x.get('error')) for part in report.get('segments', [report]) for x in part['videos']],
                                   'deferred_count': len(deferred),
+                                  'processed_pool_skipped': pool_skipped,
+                                  **({'workflow_status': report['workflow_status'],
+                                      'ai_results': ai_report['results'], 'processed_results': completed}
+                                     if ai_report is not None else {}),
                                   **({'transcode_counts': transcode_report['counts'],
                                       'transcode_report': str(transcode_path)} if transcode_report else {})}))
+                if args.command == 'run':
+                    return 0 if report.get('workflow_status') == 'complete' else 2
                 return 0 if (report.get('delivery_accepted') is True
                              or report['status'] == 'all_archived') else 2
             elif args.command == 'ai':
@@ -661,28 +753,15 @@ def main():
                 # authenticated/service_role direct table access is a deliberate,
                 # kept decision (not drift), confirmed by the project owner.
                 storage.bucket()
-                from video_archive.pipeline.ai import build_provider
-                from video_archive.pipeline.batch import select_ai_drama_candidates
-                provider = build_provider()
+                from video_archive.pipeline.workflow import process_ai, finalize_processed
                 cache = Cache(args.data, project_ref=c['project_ref'])
-                committed, _ = committed_inventory(db, approved_rows)
-                candidates = select_ai_drama_candidates(approved_rows, committed, limit=args.limit)
-                results = []
-                for did in candidates:
-                    entry = {'drama_id': did}
-                    try:
-                        run_ai(db, storage, cache, did, provider)
-                        entry['result'] = 'ai_succeeded'
-                    except PipelineError as exc:
-                        entry.update(result='skipped' if str(exc) == 'task_not_claimable' else 'failed',
-                                     error=str(exc))
-                    except Exception as exc:
-                        # Lease.__exit__ already recorded this on the task row (if the
-                        # lease was still valid); keep this candidate's failure local
-                        # and move on to the next one instead of aborting the whole pass.
-                        entry.update(result='failed', error=error_code(exc))
-                    results.append(entry)
-                print(json.dumps({'processed': len(results), 'results': results}))
+                ai_path = args.data / ('pipeline-ai-' + now().replace(':', '-') + '.json')
+                ai_report = process_ai(db, storage, cache, approved_rows, analyze=run_ai,
+                                       limit=args.limit, report_path=ai_path)
+                finalized = finalize_processed(db, approved_rows, path=pool_path,
+                                               project_ref=c['project_ref'], report_path=ai_path)
+                print(json.dumps({**ai_report, 'processed_results': finalized, 'report': str(ai_path)}))
+                return 0 if ai_report['status'] == 'complete' else 2
             elif args.command == 'transcode-backlog':
                 approved_rows = filter_approved_rows(
                     outcome_file(args.data, c['project_ref']), c['project_ref'], rows)
@@ -754,6 +833,8 @@ def main():
     except (Exception, KeyboardInterrupt, asyncio.CancelledError) as exc:
         print('STOP: ' + error_code(exc), file=sys.stderr)
         return 130 if isinstance(exc, (KeyboardInterrupt, asyncio.CancelledError)) else 2
+    finally:
+        resources.close()
 
 
 if __name__ == '__main__':

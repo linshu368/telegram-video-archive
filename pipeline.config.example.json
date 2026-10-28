@@ -1,0 +1,12 @@
+{
+  "project_ref": "",
+  "region": "",
+  "plan": "",
+  "database_dsn": "",
+  "storage_key": "",
+  "global_file_limit": null,
+  "bucket_file_limit": null,
+  "dashboard_verified_at": "",
+  "sample_budget_note": "",
+  "sample_budget_confirmed": false
+}

@@ -1,0 +1,10 @@
+.venv/
+__pycache__/
+*.pyc
+.private/
+archive/
+*.session*
+.env*
+!.env.example
+*.log
+.DS_Store

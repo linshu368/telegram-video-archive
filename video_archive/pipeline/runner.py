@@ -11,14 +11,17 @@ import sqlite3
 import sys
 import time
 from contextlib import contextmanager
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 from video_archive.core import atomic_json, cover_filename, filename, now, sha256, validate_file
 from video_archive.pipeline.cache import Cache, legacy_entry
 from video_archive.pipeline.common import (BASE, PipelineError, ai_output, config, cover_object_path,
-                             covers_committed, error_code, identity, object_path, snapshot)
+                             error_code, identity, object_path, snapshot)
 from video_archive.pipeline.db import Database, Lease
 from video_archive.pipeline.storage import Storage
+from video_archive.pipeline.outcomes import outcome_file, filter_approved_rows
+from video_archive.paths import cli_path
 from video_archive.screening.quality import QualityPolicy
 
 TOPICS = BASE / 'archive/topics-20261019-184029-928673/topics.json'
@@ -84,6 +87,43 @@ def verify_identity(video, record, cloud):
             ('source_id', record['source']['id']), ('message_id', record['message_id']),
             ('media_id', record['media_id']))):
         raise PipelineError('archive_identity_conflict')
+
+
+
+def committed_inventory(db, rows):
+    """Confirm source-specific committed members without reading media bytes.
+
+    The legacy index contains message ids across sources. A matching number is
+    only a candidate; the full video identity and committed stages must agree.
+    """
+    candidates = set(db.archived_messages())
+    jobs = [job for job in rows if job[2]['message_id'] in candidates]
+
+    def inspect(job):
+        _, video, record, _ = job
+        cloud = db.state(video['id'])
+        if not cloud:
+            return None
+        verify_identity(video, record, cloud)
+        path = cloud.get('object_path')
+        if path and path != object_path(video['id']):
+            raise PipelineError('archive_identity_conflict')
+        cover_path = cloud.get('cover_path')
+        if cover_path and cover_path != cover_object_path(video['id']):
+            raise PipelineError('archive_identity_conflict')
+        tasks = cloud.get('tasks') or {}
+        if not path or (tasks.get('upload') or {}).get('status') != 'succeeded':
+            return None
+        cover_done = (all((tasks.get(stage) or {}).get('status') == 'succeeded'
+                          for stage in ('cover_download', 'cover_upload'))
+                      and bool(cover_path or cloud.get('cover_note')))
+        return record['message_id'], cover_done
+
+    if not jobs:
+        return set(), set()
+    with ThreadPoolExecutor(max_workers=4) as pool:
+        receipts = [receipt for receipt in pool.map(inspect, jobs) if receipt is not None]
+    return {mid for mid, _ in receipts}, {mid for mid, covered in receipts if covered}
 
 
 def sample_evidence(db, cache, video, record):
@@ -378,12 +418,14 @@ def main():
     parser.add_argument('--config', type=Path, default=BASE / '.private/pipeline.json')
     parser.add_argument('--data', type=Path, default=BASE / 'archive')
     parser.add_argument('--topics', type=Path, default=TOPICS)
-    parser.add_argument('command', choices=['init-config', 'check', 'inventory', 'plan', 'verify-samples', 'migrate', 'bucket', 'import', 'samples', 'batch', 'run', 'retry', 'ai', 'transcode-backlog'])
+    parser.add_argument('command', choices=['init-config', 'check', 'inventory', 'plan', 'verify-samples', 'migrate', 'bucket', 'import', 'samples', 'batch', 'run', 'retry', 'repair', 'ai', 'transcode-backlog'])
     parser.add_argument('--report', type=Path, help='plan: save full decisions; retry: resume a report for this target project')
     parser.add_argument('--migration', help='migrate: one incremental file name under migrations/')
     parser.add_argument('--include-deferred', action='store_true', help='retry: explicitly include deferred with the chosen size threshold')
-    parser.add_argument('--retry-rounds', type=int, default=1, choices=range(0, 3), help='run: bounded retry sweeps after the normal queue')
+    parser.add_argument('--retry-rounds', type=int, default=4, choices=range(0, 5), help='download: retry rounds within the same drama channel (default 4)')
     parser.add_argument('--limit', type=int, help='download: soft video target, finish the current drama; ai/transcode-backlog: cap candidates')
+    parser.add_argument('--drama-concurrency', type=int, default=1, choices=range(1, 9),
+                        help='concurrent drama channels; file concurrency remains global')
     parser.add_argument('--drama-limit', type=int, help='download: maximum number of whole dramas to schedule')
     parser.add_argument('--minimum-quality', type=int, choices=(480, 720, 1080),
                         help='minimum drama quality tier (default 720; retry reuses its saved policy)')
@@ -398,9 +440,11 @@ def main():
     parser.add_argument('--cleanup', action='store_true', help='batch: delete local file after verified cloud commit')
     parser.add_argument('--cache-high-gb', type=int, default=10, choices=range(1, 41))
     args = parser.parse_args()
+    for name in ('config', 'data', 'topics', 'report'):
+        value = getattr(args, name)
+        if value is not None:
+            setattr(args, name, cli_path(value))
     os.umask(0o077)
-    if any(not p.is_absolute() for p in (args.config, args.data, args.topics, *([args.report] if args.report else []))):
-        parser.error('all paths must be absolute')
     try:
         if args.command == 'init-config':
             args.config.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
@@ -423,13 +467,13 @@ def main():
                               'bucket': storage.bucket(), 'cover_bucket': storage.cover_bucket()}))
             return 0
         rows, excluded = snapshot(args.data, args.topics,
-                                  require_complete=args.command in ('plan', 'batch', 'run', 'retry'))
+                                  require_complete=args.command in ('plan', 'batch', 'run', 'retry', 'repair', 'ai', 'transcode-backlog'))
         samples = [row for row in rows if row[2]['message_id'] in SAMPLES]
         if args.command == 'inventory':
             print(json.dumps({'eligible_videos': len(rows), 'dramas': len({r[0]['id'] for r in rows}),
                               'excluded': excluded, 'remote_access': False}))
             return 0
-        if args.command in ('plan', 'batch', 'run', 'retry'):
+        if args.command in ('plan', 'batch', 'run', 'retry', 'repair'):
             if args.command == 'retry' and (args.report is None or args.only or args.first):
                 raise PipelineError('retry_report_required_no_manual_ids')
             if not 1 <= args.max_video_mib <= 5120 or not 30 <= args.download_timeout <= 86400:
@@ -464,7 +508,7 @@ def main():
                     summary['report'] = str(args.report)
                 print(json.dumps(summary))
                 return 0
-        if args.command not in ('batch', 'run', 'retry') and len(samples) != 2:
+        if args.command in ('samples', 'verify-samples') and len(samples) != 2:
             raise PipelineError('sample_inventory_incomplete')
         private = BASE / '.private'
         private.mkdir(mode=0o700, exist_ok=True)
@@ -516,12 +560,12 @@ def main():
                     for name in names:
                         connection.execute((BASE / 'migrations' / name).read_text())
                 print('migration_applied')
-            elif args.command in ('batch', 'run', 'retry'):
+            elif args.command in ('batch', 'run', 'retry', 'repair'):
                 from video_archive.pipeline.batch import run_batch, plan_dramas, retry_plan_dramas
                 permissions = db.verify_worker()
                 storage.bucket()
                 storage.cover_bucket()
-                archived, covered = db.archived_messages(), covers_committed(args.data, c['project_ref'])
+                archived, covered = committed_inventory(db, rows)
                 # Carried for their cover only: their video object is already committed.
                 cover_only = {mid for mid in archived if mid not in covered}
                 if args.command == 'retry':
@@ -536,7 +580,10 @@ def main():
                         rows, args.data, archived, quality_policy=quality_policy,
                         only=args.only, first=args.first, max_bytes=args.max_video_mib * 1024**2,
                         bucket_limit=storage.limit, covered=covered, cover_only=cover_only,
-                        video_limit=args.limit, drama_limit=args.drama_limit)
+                        video_limit=args.limit, drama_limit=args.drama_limit,
+                        resume_partials=args.command == 'repair',
+                        defer_ids=() if args.command == 'repair' else (3021,),
+                        force_readback=args.command != 'repair')
                 selection_path = args.data / ('pipeline-selection-' + now().replace(':', '-') + '.json')
                 atomic_json(selection_path, {'at': now(), 'project_ref': c['project_ref'],
                                             'inventory_scope': 'complete_source_topics_frozen_boundary',
@@ -549,6 +596,8 @@ def main():
                 from video_archive.core import Store
                 store = Store(args.data)
                 path = args.data / ('pipeline-' + args.command + '-' + now().replace(':', '-') + '.json')
+                for evaluation in evaluations:
+                    evaluation['report_path'] = str(path)
                 try:
                     report = asyncio.run(run_batch(c, db, storage, cache, store, jobs,
                                                    concurrency=args.concurrency, cleanup=args.cleanup,
@@ -557,9 +606,10 @@ def main():
                                                    drama_evaluations=evaluations,
                                                    quality_policy_summary=quality_policy.to_dict(),
                                                    batch_size=args.batch_size,
-                                                   **({'retry_rounds': args.retry_rounds if args.command == 'run' else 0}
-                                                      if args.command in ('run', 'retry') else {}),
-                                                   resume_partials=args.command == 'retry',
+                                                   retry_rounds=args.retry_rounds,
+                                                   drama_concurrency=args.drama_concurrency,
+                                                   outcome_path=outcome_file(args.data, c['project_ref']),
+                                                   resume_partials=args.command in ('retry', 'repair'),
                                                    project_ref=c['project_ref'], deferred=deferred))
                 finally:
                     store.db.close()
@@ -571,10 +621,10 @@ def main():
                 # (flood/disk/db) should not take on more network work on top.
                 if args.command == 'run' and not report.get('stop_reason'):
                     from video_archive.pipeline.batch import drain_transcode, select_ai_candidates
-                    selected_dramas = {item['drama_id'] for item in evaluations
-                                       if item.get('planning_status') in ('scheduled', 'already_complete')}
-                    selected_rows = [row for row in rows if row[1]['drama_id'] in selected_dramas]
-                    candidates = select_ai_candidates(selected_rows, db.archived_messages(), limit=None)
+                    selected_rows = filter_approved_rows(
+                        outcome_file(args.data, c['project_ref']), c['project_ref'], rows)
+                    committed, _ = committed_inventory(db, selected_rows)
+                    candidates = select_ai_candidates(selected_rows, committed, limit=None)
                     transcode_path = args.data / ('pipeline-transcode-' + now().replace(':', '-') + '.json')
                     transcode_report = asyncio.run(drain_transcode(
                         db, storage, cache, candidates,
@@ -583,12 +633,30 @@ def main():
                                   'drama_selection_report': str(selection_path),
                                   **drama_selection_summary(evaluations),
                                   'cover_counts': report.get('cover_counts', {}),
+                                  'dramas': [{'drama_id': item['drama_id'],
+                                              'expected': item.get('expected_count', item.get('video_count', 0)),
+                                              'verified': item.get('verified_video_count', 0),
+                                              'missing': item.get('missing_video_count'),
+                                              'missing_ratio': item.get('missing_video_ratio'),
+                                              'decision': item.get('delivery_decision'),
+                                              'cover_complete': item.get('cover_complete'),
+                                              'missing_message_ids': item.get('remaining_video_message_ids', []),
+                                              'state': item.get('state')}
+                                             for item in report.get('dramas', [])],
                                   'results': [(x['message_id'], x['result'], x.get('error')) for part in report.get('segments', [report]) for x in part['videos']],
                                   'deferred_count': len(deferred),
                                   **({'transcode_counts': transcode_report['counts'],
                                       'transcode_report': str(transcode_path)} if transcode_report else {})}))
-                return 0 if report['status'] == 'all_archived' else 2
+                return 0 if (report.get('delivery_accepted') is True
+                             or report['status'] == 'all_archived') else 2
             elif args.command == 'ai':
+                approved_rows = filter_approved_rows(
+                    outcome_file(args.data, c['project_ref']), c['project_ref'], rows)
+                if not approved_rows:
+                    print(json.dumps({'processed': 0, 'results': [],
+                                      'download_gate_excluded_videos': len(rows),
+                                      'reason': 'download_completeness_not_approved'}))
+                    return 0
                 # Pre-flight client-privilege audit intentionally skipped here: anon/
                 # authenticated/service_role direct table access is a deliberate,
                 # kept decision (not drift), confirmed by the project owner.
@@ -597,7 +665,8 @@ def main():
                 from video_archive.pipeline.batch import select_ai_drama_candidates
                 provider = build_provider()
                 cache = Cache(args.data, project_ref=c['project_ref'])
-                candidates = select_ai_drama_candidates(rows, db.archived_messages(), limit=args.limit)
+                committed, _ = committed_inventory(db, approved_rows)
+                candidates = select_ai_drama_candidates(approved_rows, committed, limit=args.limit)
                 results = []
                 for did in candidates:
                     entry = {'drama_id': did}
@@ -615,6 +684,13 @@ def main():
                     results.append(entry)
                 print(json.dumps({'processed': len(results), 'results': results}))
             elif args.command == 'transcode-backlog':
+                approved_rows = filter_approved_rows(
+                    outcome_file(args.data, c['project_ref']), c['project_ref'], rows)
+                if not approved_rows:
+                    print(json.dumps({'processed': 0, 'results': [],
+                                      'download_gate_excluded_videos': len(rows),
+                                      'reason': 'download_completeness_not_approved'}))
+                    return 0
                 # No Telegram connection needed: this only rewraps an already-uploaded
                 # object in place. Iterates every archived video and relies on
                 # claim() to skip anything without a pending 'transcode' row (not
@@ -622,7 +698,8 @@ def main():
                 storage.bucket()
                 from video_archive.pipeline.batch import select_ai_candidates
                 cache = Cache(args.data, project_ref=c['project_ref'])
-                candidates = select_ai_candidates(rows, db.archived_messages(), limit=args.limit)
+                committed, _ = committed_inventory(db, approved_rows)
+                candidates = select_ai_candidates(approved_rows, committed, limit=args.limit)
                 results = []
                 for _, v, r, _ in candidates:
                     entry = {'message_id': r['message_id'], 'video_id': v['id']}

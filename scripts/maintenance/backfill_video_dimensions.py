@@ -19,7 +19,7 @@ if __package__ in (None, ''):
 import psycopg
 from psycopg.conninfo import conninfo_to_dict
 
-from video_archive.paths import BASE
+from video_archive.paths import BASE, cli_path
 MAIN_REF = 'wbtsfzozlmurljvglhpn'
 INT_MAX = 2_147_483_647
 
@@ -122,6 +122,7 @@ def main():
     parser.add_argument('--catalog', type=Path, default=BASE / 'archive/index.csv')
     parser.add_argument('--commit', action='store_true', help='write rows; omit to only count')
     args = parser.parse_args()
+    args.config, args.catalog = cli_path(args.config), cli_path(args.catalog)
     if not args.catalog.is_file() or args.catalog.is_symlink():
         fail('catalog_missing')
     incoming = catalog(args.catalog)

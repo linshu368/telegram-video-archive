@@ -2,6 +2,8 @@
 
 代码按职责分组，下载队列新增整剧依次调度；视频下载、上传、校验和缓存清理内核沿用原实现。运行配置、会话、数据目录及数据库迁移的位置不变。
 
+以下命令均从仓库根目录执行，并使用已安装项目依赖的 Python 环境。
+
 ## 三个日常入口
 
 | 根目录入口 | 实际实现 | 用途 |
@@ -13,9 +15,9 @@
 原来的 `python archive.py ...`、`python pipeline.py ...`、`python topic_metadata.py ...` 命令继续可用。根入口只负责转交调用，业务实现集中在下面的目录。
 
 ```sh
-"/Users/qianpeijia/Documents/ChatGPT/短剧/telegram-video-archive/.venv/bin/python" "/Users/qianpeijia/Documents/ChatGPT/短剧/telegram-video-archive/archive.py" --help
-"/Users/qianpeijia/Documents/ChatGPT/短剧/telegram-video-archive/.venv/bin/python" "/Users/qianpeijia/Documents/ChatGPT/短剧/telegram-video-archive/pipeline.py" --help
-"/Users/qianpeijia/Documents/ChatGPT/短剧/telegram-video-archive/.venv/bin/python" "/Users/qianpeijia/Documents/ChatGPT/短剧/telegram-video-archive/topic_metadata.py" --help
+python archive.py --help
+python pipeline.py --help
+python topic_metadata.py --help
 ```
 
 ## 业务代码：`video_archive/`
@@ -30,25 +32,32 @@
 | `screening/quality.py` | 用完整成员清单判断方向、分辨率、码率和整剧画质档位 |
 | `pipeline/runner.py` | 主流程命令和现有任务接线 |
 | `pipeline/common.py` | 配置校验、稳定身份、快照、通用错误与数据转换 |
-| `pipeline/batch.py` | 整剧计划、按剧推进、剧内并发、分段与失败恢复 |
+| `pipeline/batch.py` | 整剧计划、剧通道、全局视频并发、分段、补齐和最终判定 |
+| `pipeline/completion.py` | 源视频清单、逐集收据核对、缺集判定和中断报告恢复 |
+| `pipeline/outcomes.py` | 保存整剧交付结果，按同一份源清单限制后续 AI 与转码准入 |
 | `pipeline/cache.py` | 有界本地缓存、预留、锁与清理记录 |
 | `pipeline/db.py` | 数据库访问、事务函数和任务租约 |
 | `pipeline/storage.py` | 对象存储、分块上传与远端读回验证 |
 | `pipeline/ai.py` | 抽帧、模型调用、提示词和用量记录 |
 | `pipeline/transcode.py` | 现有转码处理 |
 
-主流程是：**收齐源话题信息 → 整剧筛选 → 合格剧整组计划 → 逐剧下载/校验/上传 → 原 AI 与转码处理**。筛选保留合格剧的全部成员；忽略少量画质异常只影响评分。
+主流程是：**收齐源话题信息 → 整剧画质筛选 → 合格剧整组计划 → 每个剧通道完成传输、补齐及判定 → 通过的剧进入原 AI 与转码处理**。画质筛选始终保留合格剧的全部成员，少量低质异常只影响评分。
 
-下载计划、执行和重试统一使用整剧流程。文件资格检查、文件传输与线程取消保护作为共享工具复用，旧的逐视频调度分支已移除。三个根入口只转接到实际模块，没有另一份业务实现。
+下载计划、执行和重试统一使用整剧流程。每个剧通道占用至该剧传输、有界重试和最终判定结束，不能中途换剧。`--drama-concurrency` 默认 1，允许多个剧通道；`--concurrency` 默认 4，仍是全部通道共享的视频任务上限，不相乘。单段默认 100、最多 500 个视频。
 
-下载队列以剧为单位：一部剧的全部分段尝试结束后才进入下一部，剧内保留并发，单段最多 500 个视频，默认 100。`--only/--first` 指定一集会扩展到整剧；`--limit` 是视频数量软目标，当前剧完整纳入，达到目标后再停止接下一部；`--drama-limit N` 直接限制本次剧数。普通单集失败将剧记为未完成并保留待办，硬停止则停止队列。整剧是否完成按所有预期成员和云端已完成状态核对，视频完成与封面完成分别记录。
+默认初次处理后最多做 4 轮补齐，数据库累计最多 5 次尝试的限制仍有效。租约、次数上限或硬性大小约束不能通过重置状态绕过；失败原因和每次重试历史保留。最终以完整源清单为分母：全部视频已验证提交为 `complete`，尚未验证的唯一视频比例严格小于 10% 为 `accepted_with_gaps`，否则拒绝。硬停止或中断为 `pending`。下载缺失率与画质评分的 10% 异常预算分别计算。
+
+`--only/--first` 扩展到整剧；`--limit` 是视频数量软目标，当前剧完整纳入后才停止接新剧；`--drama-limit N` 直接限制本次剧数。视频验证指下载验证、上传读回且云端提交完成，不要求所有集同时占据本地缓存。封面完成另行记录，缺失率按预期视频计算。
+
+`repair` 根据源完整清单和已验证云提交重算缺口，无需旧 report；已齐的旧数据只做审计，无需重新下载，缺失成员和 partial 才进入补齐。
 
 按整剧处理一部的入口示例：
 
 ```sh
-"/Users/qianpeijia/Documents/ChatGPT/短剧/telegram-video-archive/.venv/bin/python" \
-  "/Users/qianpeijia/Documents/ChatGPT/短剧/telegram-video-archive/pipeline.py" \
-  --data "/Users/qianpeijia/Documents/ChatGPT/短剧/telegram-video-archive/archive" batch --drama-limit 1
+python pipeline.py batch --drama-limit 1
+
+# 对已有数据重算缺口，只补缺失，不需要旧报告
+python pipeline.py repair
 ```
 
 以上是使用方式，目录整理和测试不等于已经运行真实 Telegram 下载。
@@ -70,18 +79,15 @@
 查看维护脚本或诊断脚本参数的示例：
 
 ```sh
-"/Users/qianpeijia/Documents/ChatGPT/短剧/telegram-video-archive/.venv/bin/python" \
-  "/Users/qianpeijia/Documents/ChatGPT/短剧/telegram-video-archive/scripts/maintenance/backfill_video_dimensions.py" --help
+python scripts/maintenance/backfill_video_dimensions.py --help
 
-"/Users/qianpeijia/Documents/ChatGPT/短剧/telegram-video-archive/.venv/bin/python" \
-  "/Users/qianpeijia/Documents/ChatGPT/短剧/telegram-video-archive/scripts/diagnostics/probe_download.py" --help
+python scripts/diagnostics/probe_download.py --help
 ```
 
 离线验收脚本的新调用位置：
 
 ```sh
-"/Users/qianpeijia/Documents/ChatGPT/短剧/telegram-video-archive/.venv/bin/python" \
-  "/Users/qianpeijia/Documents/ChatGPT/短剧/telegram-video-archive/scripts/validation/validate_implementation.py"
+python scripts/validation/validate_implementation.py
 ```
 
 诊断和维护脚本保留原有用途；其中读取网络、下载探测或补写数据库的操作，只有显式运行对应脚本才发生。目录整理不会自动执行这些操作。
@@ -95,19 +101,22 @@
 | `config/examples/pipeline.ai.config.example.json` | AI 配置示例 |
 | `prompts/prompt.md` | 原 AI 系统提示词，内容不变 |
 | `.private/` | 原本机凭证、会话、白名单、真实配置与锁，位置不变，不提交 |
-| `archive/` | 原扫描状态、清单、报告、下载文件和缓存，位置不变，不提交 |
+| `archive/` | 扫描状态、完整清单、逐视频报告、下载文件和缓存，位置不变，不提交 |
+| `archive/pipeline/projects/<project_ref>/drama-outcomes.json` | 持久化整剧最终判定；AI/转码核对通过状态和清单一致性 |
 | `migrations/` | 原 SQL 迁移，文件内容和执行顺序不变 |
 | `tests/` | 原回归测试及整剧调度检查 |
 | `requirements.lock` | 原依赖版本锁定文件 |
+
+拒绝或 `pending` 的剧不进入后续 AI 或转码，已上传的云端对象不会因此被主动删除。`ai` 和 `transcode-backlog` 读取持久化结果，只选择已经判定通过且与当前完整清单一致的剧；从未评定的旧数据先运行 `repair` 审计。
 
 配置模板和提示词只移动位置，没有修改内容。三个日常入口仍以项目根目录定位 `.private/` 和 `archive/`，从其他工作目录使用绝对入口路径也不会把它们写到源码目录。
 
 ## 文档
 
-- [README](/Users/qianpeijia/Documents/ChatGPT/短剧/telegram-video-archive/README.md)：日常入口与当前流程。
-- [PIPELINE](/Users/qianpeijia/Documents/ChatGPT/短剧/telegram-video-archive/docs/PIPELINE.md)：操作参数、整剧筛选规则和流程边界。
-- [Supabase 设计](/Users/qianpeijia/Documents/ChatGPT/短剧/telegram-video-archive/docs/SUPABASE_PIPELINE_DESIGN.md)：双流程与存储、数据库设计。
-- [本地归档历史](/Users/qianpeijia/Documents/ChatGPT/短剧/telegram-video-archive/docs/history/LOCAL_ARCHIVE.md)：原 README 中的本地归档说明与历史验收。
-- [实施记录](/Users/qianpeijia/Documents/ChatGPT/短剧/telegram-video-archive/docs/history/IMPLEMENTATION_RESULTS.md)、[交接记录](/Users/qianpeijia/Documents/ChatGPT/短剧/telegram-video-archive/docs/history/PROGRESS_HANDOFF.md)：历史运行事实。
+- [README](../README.md)：日常入口与当前流程。
+- [PIPELINE](PIPELINE.md)：操作参数、整剧筛选规则和流程边界。
+- [Supabase 设计](SUPABASE_PIPELINE_DESIGN.md)：双流程与存储、数据库设计。
+- [本地归档历史](history/LOCAL_ARCHIVE.md)：原 README 中的本地归档说明与历史验收。
+- [实施记录](history/IMPLEMENTATION_RESULTS.md)、[交接记录](history/PROGRESS_HANDOFF.md)：历史运行事实。
 
 历史记录正文中的旧机器路径保留，用来还原当时的执行环境；可点击的项目文件链接已指向本次整理后的文件。历史生产启动授权不表示本次已经执行生产操作。

@@ -103,7 +103,7 @@
 
 把 Telegram 短剧群（单一来源，约 5,212 个视频、约 608 GB）归档到 Supabase 私有桶，并为每个视频准备 AI 备用标题/标签/简介。
 
-- 设计以 [SUPABASE_PIPELINE_DESIGN.md](/Users/qianpeijia/Documents/ChatGPT/短剧/telegram-video-archive/docs/SUPABASE_PIPELINE_DESIGN.md) 的 v2 为准：业务 schema `drama_archive`，只有 4 张表（dramas、videos、ai_results、pipeline_tasks），私有桶 `drama-videos`，对象路径 `videos/{video_id}/original`。
+- 设计以 [SUPABASE_PIPELINE_DESIGN.md](../SUPABASE_PIPELINE_DESIGN.md) 的 v2 为准：业务 schema `drama_archive`，只有 4 张表（dramas、videos、ai_results、pipeline_tasks），私有桶 `drama-videos`，对象路径 `videos/{video_id}/original`。
 - 流程一：Telegram 下载 → 本地校验 → 上传桶 → 远端完整读回 SHA-256 → 事务提交 object_path → 释放本地缓存。流程二：AI（尚未接入真实模型）。
 - Worker 通过 PostgreSQL 直连调用受限函数，不走 PostgREST。
 - test 阶段已有基础闭环证据；最新阶段转为 main 接入准备，按顶部最新决议推进。
@@ -112,21 +112,21 @@
 
 | 文件 | 作用 |
 |---|---|
-| [SUPABASE_PIPELINE_DESIGN.md](/Users/qianpeijia/Documents/ChatGPT/短剧/telegram-video-archive/docs/SUPABASE_PIPELINE_DESIGN.md) | v2 设计（权威） |
-| [IMPLEMENTATION_RESULTS.md](/Users/qianpeijia/Documents/ChatGPT/短剧/telegram-video-archive/docs/history/IMPLEMENTATION_RESULTS.md) | 第一轮和第二轮（两样本真实上传）交付记录 |
-| [PIPELINE.md](/Users/qianpeijia/Documents/ChatGPT/短剧/telegram-video-archive/docs/PIPELINE.md)、[README.md](/Users/qianpeijia/Documents/ChatGPT/短剧/telegram-video-archive/README.md) | 运行、恢复、权限说明 |
-| [migrations/001_pipeline.sql](/Users/qianpeijia/Documents/ChatGPT/短剧/telegram-video-archive/migrations/001_pipeline.sql) | 四表、约束、RLS、事务函数（已改：并发导入冲突，见 §4） |
-| [migrations/002_archived_messages.sql](/Users/qianpeijia/Documents/ChatGPT/短剧/telegram-video-archive/migrations/002_archived_messages.sql) | 新增受限函数，返回云端已提交的 message_id |
-| [migrations/003_import_video_concurrency.sql](/Users/qianpeijia/Documents/ChatGPT/短剧/telegram-video-archive/migrations/003_import_video_concurrency.sql) | 修复并发导入同一剧时 dramas 主键冲突，只替换 import_video 函数体 |
-| [pipeline.py](/Users/qianpeijia/Documents/ChatGPT/短剧/telegram-video-archive/pipeline.py) | CLI：check、inventory、plan、verify-samples、migrate、bucket、import、samples、batch、run |
-| [pipeline_batch.py](/Users/qianpeijia/Documents/ChatGPT/短剧/telegram-video-archive/video_archive/pipeline/batch.py) | 新增：有界批量调度（并发门、限流降并发、缓存暂停、清理） |
-| [pipeline_common.py](/Users/qianpeijia/Documents/ChatGPT/短剧/telegram-video-archive/video_archive/pipeline/common.py) | 配置校验（已接受 Supavisor 池化主机）、稳定 UUID、快照导入 |
-| [pipeline_db.py](/Users/qianpeijia/Documents/ChatGPT/短剧/telegram-video-archive/video_archive/pipeline/db.py) | 数据库调用、租约；新增连接重试和并发上限 6 |
-| [pipeline_storage.py](/Users/qianpeijia/Documents/ChatGPT/短剧/telegram-video-archive/video_archive/pipeline/storage.py) | TUS 上传、流式读回 SHA-256 |
-| [pipeline_cache.py](/Users/qianpeijia/Documents/ChatGPT/短剧/telegram-video-archive/video_archive/pipeline/cache.py) | 本地缓存日志、水位、保护、清理 |
-| [archive.py](/Users/qianpeijia/Documents/ChatGPT/短剧/telegram-video-archive/archive.py)、[core.py](/Users/qianpeijia/Documents/ChatGPT/短剧/telegram-video-archive/video_archive/core.py) | 原下载与校验；archive.py 已增加目标库判断、异步校验/状态钩子、部分文件保护和计时 |
-| [tests/test_pipeline.py](/Users/qianpeijia/Documents/ChatGPT/短剧/telegram-video-archive/tests/test_pipeline.py) | 新增测试（含本机 PostgreSQL 测试） |
-| [tests/test_pipeline_scheduling.py](/Users/qianpeijia/Documents/ChatGPT/短剧/telegram-video-archive/tests/test_pipeline_scheduling.py) | 项目隔离、调度停止、取消、分段失败推进和部分文件保留测试 |
+| [SUPABASE_PIPELINE_DESIGN.md](../SUPABASE_PIPELINE_DESIGN.md) | v2 设计（权威） |
+| [IMPLEMENTATION_RESULTS.md](IMPLEMENTATION_RESULTS.md) | 第一轮和第二轮（两样本真实上传）交付记录 |
+| [PIPELINE.md](../PIPELINE.md)、[README.md](../../README.md) | 运行、恢复、权限说明 |
+| [migrations/001_pipeline.sql](../../migrations/001_pipeline.sql) | 四表、约束、RLS、事务函数（已改：并发导入冲突，见 §4） |
+| [migrations/002_archived_messages.sql](../../migrations/002_archived_messages.sql) | 新增受限函数，返回云端已提交的 message_id |
+| [migrations/003_import_video_concurrency.sql](../../migrations/003_import_video_concurrency.sql) | 修复并发导入同一剧时 dramas 主键冲突，只替换 import_video 函数体 |
+| [pipeline.py](../../pipeline.py) | CLI：check、inventory、plan、verify-samples、migrate、bucket、import、samples、batch、run |
+| [pipeline_batch.py](../../video_archive/pipeline/batch.py) | 新增：有界批量调度（并发门、限流降并发、缓存暂停、清理） |
+| [pipeline_common.py](../../video_archive/pipeline/common.py) | 配置校验（已接受 Supavisor 池化主机）、稳定 UUID、快照导入 |
+| [pipeline_db.py](../../video_archive/pipeline/db.py) | 数据库调用、租约；新增连接重试和并发上限 6 |
+| [pipeline_storage.py](../../video_archive/pipeline/storage.py) | TUS 上传、流式读回 SHA-256 |
+| [pipeline_cache.py](../../video_archive/pipeline/cache.py) | 本地缓存日志、水位、保护、清理 |
+| [archive.py](../../archive.py)、[core.py](../../video_archive/core.py) | 原下载与校验；archive.py 已增加目标库判断、异步校验/状态钩子、部分文件保护和计时 |
+| [tests/test_pipeline.py](../../tests/test_pipeline.py) | 新增测试（含本机 PostgreSQL 测试） |
+| [tests/test_pipeline_scheduling.py](../../tests/test_pipeline_scheduling.py) | 项目隔离、调度停止、取消、分段失败推进和部分文件保留测试 |
 
 私有文件（不要打印内容）：
 
@@ -173,12 +173,12 @@
 
 ```sh
 # 本机 PostgreSQL 实例（端口 55440）需先在运行；测试代码会清空该测试库的 drama_archive，严禁指向 Supabase
-DRAMA_TEST_DSN='host=127.0.0.1 port=55440 user=postgres dbname=drama_pipeline_test' /Users/qj/python_project/telegram-video-archive/.venv/bin/python -m unittest discover -s /Users/qj/python_project/telegram-video-archive/tests
+DRAMA_TEST_DSN='host=127.0.0.1 port=55440 user=postgres dbname=drama_pipeline_test' python -m unittest discover -s tests
 # 离线查看正常/大文件分流，不联网
-/Users/qj/python_project/telegram-video-archive/.venv/bin/python /Users/qj/python_project/telegram-video-archive/pipeline.py plan --max-video-mib 128
+python pipeline.py plan --max-video-mib 128
 # 以下是 main 配置准备并核验后才执行的入口示意；配置文件路径以用户实际提供为准
-/Users/qj/python_project/telegram-video-archive/.venv/bin/python /Users/qj/python_project/telegram-video-archive/pipeline.py --config /Users/qj/python_project/telegram-video-archive/.private/main-pipeline.json check
-/Users/qj/python_project/telegram-video-archive/.venv/bin/python /Users/qj/python_project/telegram-video-archive/pipeline.py --config /Users/qj/python_project/telegram-video-archive/.private/main-pipeline.json run --batch-size 100 --concurrency 4 --max-video-mib 128 --cleanup
+python pipeline.py --config .private/main-pipeline.json check
+python pipeline.py --config .private/main-pipeline.json run --batch-size 100 --concurrency 4 --max-video-mib 128 --cleanup
 ```
 
 - 批量运行用 `batch --limit N`，N 为 1 到 100，报告写到 `archive/pipeline-batch-*.json`，读报告前先确认进程是否还在跑。

@@ -210,7 +210,7 @@ class DramaCliTests(unittest.TestCase):
                   patch('video_archive.pipeline.runner.config', return_value=config),
                   patch('video_archive.pipeline.runner.Database', return_value=db),
                   patch('video_archive.pipeline.runner.Storage', return_value=storage), patch('video_archive.pipeline.runner.Cache'),
-                  patch('video_archive.pipeline.runner.backup_legacy'), patch('video_archive.pipeline.runner.covers_committed', return_value=set()),
+                  patch('video_archive.pipeline.runner.backup_legacy'),
                   patch('video_archive.pipeline.batch.run_batch', runner),
                   patch('video_archive.pipeline.batch.drain_transcode', new=AsyncMock(return_value={'counts': {}})),
                   contextlib.redirect_stdout(io.StringIO())):
@@ -236,7 +236,6 @@ class DramaCliTests(unittest.TestCase):
                   patch('video_archive.pipeline.runner.Storage', return_value=storage),
                   patch('video_archive.pipeline.runner.Cache'),
                   patch('video_archive.pipeline.runner.backup_legacy'),
-                  patch('video_archive.pipeline.runner.covers_committed', return_value=set()),
                   patch('video_archive.pipeline.batch.run_batch', runner),
                   contextlib.redirect_stdout(io.StringIO())):
                 self.assertEqual(main(), 0)

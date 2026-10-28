@@ -22,7 +22,7 @@ from video_archive.core import (StopArchive, Store, atomic_json, cover_filename,
                   filename, is_general, media_tools, now, pick_thumb, record_message,
                   validate_cover, validate_file)
 
-from video_archive.paths import BASE
+from video_archive.paths import BASE, cli_path
 PRIVATE = BASE / '.private'
 
 
@@ -725,7 +725,7 @@ async def execute(args, store):
 
 def parser():
     p = argparse.ArgumentParser(description=__doc__)
-    p.add_argument('--data', type=Path, default=BASE / 'archive', help='absolute local archive directory')
+    p.add_argument('--data', type=Path, default=BASE / 'archive', help='local archive directory (relative to the current directory)')
     subs = p.add_subparsers(dest='command', required=True)
     subs.add_parser('login', help='local interactive credentials, code and 2FA')
     r = subs.add_parser('resolve', help='resolve exact target without joining')
@@ -744,9 +744,8 @@ def parser():
 
 def main():
     args = parser().parse_args()
+    args.data = cli_path(args.data)
     private_init()
-    if not args.data.is_absolute():
-        raise SystemExit('--data must be an absolute path')
     # One process per session/project; avoids competing cursors and SQLite sessions.
     with (PRIVATE / 'process.lock').open('a') as lock:
         try:

@@ -1,11 +1,11 @@
 """Whole-drama planning with a shared bounded download/upload lifecycle."""
 import asyncio
-import json
 import signal
 import threading
 import time
 from collections import Counter
 from datetime import datetime, timezone
+from decimal import Decimal, InvalidOperation
 from functools import partial
 from pathlib import Path
 
@@ -14,6 +14,10 @@ from video_archive.core import StopArchive, atomic_json, filename, now
 from video_archive.pipeline.runner import (archive_existing, cover_download_task, cover_upload_task,
                       download_task, sample_evidence, transcode_task)
 from video_archive.pipeline.common import PipelineError, error_code, mark_cover_remote
+from video_archive.pipeline.completion import (check_result_identity, check_segment, drama_progress,
+                                                manifest_digest, manifest_for_jobs, manifest_map,
+                                                read_pass_report, recover_active_segment,
+                                                validate_retry_manifests)
 
 MAX_BATCH = 500
 # 'video_already_committed': this pass carried the video only to reach its cover,
@@ -115,6 +119,9 @@ def plan_dramas(rows, root, archived, *, quality_policy, only=(), first=(),
     for did in order:
         members = groups[did]
         evaluation = evaluate_drama(members, quality_policy)
+        manifest = manifest_for_jobs(members)
+        evaluation.update(expected_manifest=manifest, expected_manifest_version=1,
+                          expected_manifest_sha256=manifest_digest(manifest))
         evaluations.append(evaluation)
         evaluation.update(
             committed_message_ids=[job[2]['message_id'] for job in members
@@ -168,9 +175,9 @@ def retry_plan_dramas(rows, root, report_path, project_ref, *, quality_policy,
                       include_deferred=False, max_bytes=128 * 1024**2, bucket_limit=None,
                       video_limit=None, drama_limit=None):
     """Expand durable retry candidates to their complete, freshly evaluated dramas."""
-    report = json.loads(Path(report_path).read_text())
-    if report.get('project_ref') != project_ref:
-        raise PipelineError('retry_report_project_mismatch')
+    rows = list(rows)
+    report = read_pass_report(report_path, project_ref)
+    identity_check = validate_retry_manifests(report, rows)
     latest = {entry['message_id']: entry for part in report.get('segments', [report])
               for entry in part.get('videos', [])}
     ids = [mid for mid, entry in latest.items()
@@ -184,12 +191,15 @@ def retry_plan_dramas(rows, root, report_path, project_ref, *, quality_policy,
                 ids.extend(mid for mid in drama.get('expected_message_ids', []) if mid not in ids)
     if not ids:
         return [], [], []
-    return plan_dramas(
+    jobs, deferred, evaluations = plan_dramas(
         rows, root, archived, quality_policy=quality_policy, only=ids,
         max_bytes=max_bytes, bucket_limit=bucket_limit,
         defer_ids=() if include_deferred else (3021,), resume_partials=True,
         covered=covered, cover_only=cover_only, video_limit=video_limit,
         drama_limit=drama_limit, force_readback=False)
+    for evaluation in evaluations:
+        evaluation['retry_source_identity'] = identity_check
+    return jobs, deferred, evaluations
 
 
 def claim_blocker(cloud):
@@ -278,6 +288,26 @@ class Gate:
         self.paused_until = max(self.paused_until, time.monotonic() + seconds)
 
 
+class _FloodRouter:
+    """One Telegram hook for a pass; concurrent batches register observers."""
+    def __init__(self, lifecycle_gate, stop):
+        self.lifecycle_gate, self.stop = lifecycle_gate, stop
+        self.observers = set()
+
+    def register(self, observer):
+        self.observers.add(observer)
+
+    def unregister(self, observer):
+        self.observers.discard(observer)
+
+    def __call__(self, seconds):
+        self.lifecycle_gate.reduce(seconds + 1)
+        if seconds > archive.MAX_FLOOD_WAIT:
+            self.stop.set()
+        for observer in tuple(self.observers):
+            observer(seconds)
+
+
 async def _threaded(abort, fn, *args, **kwargs):
     # Cancellation must not release the project lock while upload threads still run.
     pending = asyncio.create_task(asyncio.to_thread(fn, *args, **kwargs))
@@ -295,9 +325,10 @@ async def _threaded(abort, fn, *args, **kwargs):
 async def process_batch(db, storage, cache, store, client, peer, source, jobs, *,
                         concurrency=4, cleanup=False, report_path=None, pause_wait=120,
                         download_timeout=1800, abort=None, project_ref=None, deferred=(),
-                        resume_partials=False, cover_concurrency=2, cover_only=frozenset()):
+                        resume_partials=False, cover_concurrency=2, cover_only=frozenset(),
+                        lifecycle_gate=None, shared_stop=None, flood_router=None):
     states = {r['message_id']: s for r, s in store.videos()}
-    stop = asyncio.Event()
+    stop = shared_stop if shared_stop is not None else asyncio.Event()
     abort = abort if abort is not None else threading.Event()
     downloads, uploads = Gate(concurrency, stop), Gate(concurrency, stop)
     # Covers refresh their own messages, so they add RPCs the video line never made.
@@ -307,7 +338,10 @@ async def process_batch(db, storage, cache, store, client, peer, source, jobs, *
     report = {'at': now(), 'status': 'in_progress', 'requested': len(jobs), 'concurrency': concurrency,
               'cleanup': cleanup, 'flood_events': [], 'videos': [], 'ai_called': False,
               'stop_reason': None, 'project_ref': project_ref, 'deferred': list(deferred)}
-    report['videos'] = [{'message_id': r['message_id'], 'video_id': v['id'],
+    manifest = manifest_for_jobs(jobs)
+    report['expected_manifest'] = manifest
+    members = manifest_map(manifest)
+    report['videos'] = [{**members[r['message_id']],
                          'bytes': r['expected_size'], 'result': 'queued',
                          'cover_result': 'queued', 'timings': {}}
                         for _, v, r, _ in jobs]
@@ -514,11 +548,25 @@ async def process_batch(db, storage, cache, store, client, peer, source, jobs, *
         finally:
             save()
 
-    archive.on_flood = flood
+    previous_flood = archive.on_flood
+    if flood_router is None:
+        archive.on_flood = flood
+    else:
+        flood_router.register(flood)
     queue = iter(zip(jobs, report['videos']))
     async def worker():
         for job, item in queue:
-            await process(job, item)
+            if lifecycle_gate is None:
+                await process(job, item)
+                continue
+            try:
+                async with lifecycle_gate:
+                    await process(job, item)
+            except StopArchive as exc:
+                if str(exc).split(':')[0] != 'batch_stopped':
+                    raise
+                item['result'] = item['cover_result'] = 'not_started'
+                save()
     # Bound the complete in-flight lifecycle, including imports and state reads.
     # No segment-wide burst of DB requests can crowd out heartbeat work.
     tasks = [asyncio.create_task(worker()) for _ in range(min(concurrency, len(jobs)))]
@@ -538,7 +586,11 @@ async def process_batch(db, storage, cache, store, client, peer, source, jobs, *
     finally:
         ticker.cancel()
         await asyncio.gather(ticker, return_exceptions=True)
-        archive.on_flood = None
+        if flood_router is None:
+            if archive.on_flood is flood:
+                archive.on_flood = previous_flood
+        else:
+            flood_router.unregister(flood)
         save()
     return report
 
@@ -546,16 +598,28 @@ async def process_batch(db, storage, cache, store, client, peer, source, jobs, *
 async def process_drama_pass(db, storage, cache, store, client, peer, source, jobs, *,
                              drama_evaluations, batch_size=100, report_path=None,
                              deferred=(), project_ref=None, retry_rounds=0,
-                             quality_policy_summary=None, **options):
-    """Attempt one complete drama at a time, using the existing file lifecycle.
+                             quality_policy_summary=None, drama_concurrency=1,
+                             max_missing_ratio=.10, outcome_path=None, **options):
+    """Keep each drama in its lane through transfer, repair and final judgment.
 
     A large drama spans bounded segments before the next drama starts. Ordinary
-    failures are reported and repaired only by a later bounded retry sweep.
+    failures are repaired within that drama before its lane accepts another.
     """
     if type(batch_size) is not int or not 1 <= batch_size <= MAX_BATCH:
         raise PipelineError('batch_limit_out_of_range')
-    if type(retry_rounds) is not int or not 0 <= retry_rounds <= 2:
+    if type(retry_rounds) is not int or not 0 <= retry_rounds <= 4:
         raise PipelineError('invalid_retry_rounds')
+    if type(drama_concurrency) is not int or drama_concurrency <= 0:
+        raise PipelineError('invalid_drama_concurrency')
+    concurrency = options.get('concurrency', 4)
+    if type(concurrency) is not int or concurrency <= 0:
+        raise PipelineError('invalid_concurrency')
+    try:
+        missing_ratio = Decimal(str(max_missing_ratio))
+        if not missing_ratio.is_finite() or not 0 <= missing_ratio < 1:
+            raise ValueError()
+    except (InvalidOperation, ValueError):
+        raise PipelineError('invalid_missing_ratio') from None
     jobs = list(jobs)
     groups, seen_jobs = {}, set()
     for job in jobs:
@@ -568,12 +632,36 @@ async def process_drama_pass(db, storage, cache, store, client, peer, source, jo
     by_drama = {evaluation['drama_id']: evaluation for evaluation in evaluations}
     if len(by_drama) != len(evaluations) or set(groups).difference(by_drama):
         raise PipelineError('drama_evaluation_missing_or_duplicate')
+    identities, all_expected_ids = {}, set()
     for did, evaluation in by_drama.items():
+        for key in ('expected_message_ids', 'committed_message_ids', 'complete_message_ids',
+                    'scheduled_message_ids', 'cover_only_message_ids'):
+            values = evaluation.get(key, [])
+            if (not isinstance(values, list) or any(type(mid) is not int or mid <= 0 for mid in values)
+                    or len(values) != len(set(values))):
+                raise PipelineError('source_manifest_duplicate_identity')
         expected = set(evaluation.get('expected_message_ids', []))
         committed = set(evaluation.get('committed_message_ids', []))
         complete = set(evaluation.get('complete_message_ids', []))
         scheduled = set(evaluation.get('scheduled_message_ids', []))
         actual = {job[2]['message_id'] for job in groups.get(did, [])}
+        if expected & all_expected_ids:
+            raise PipelineError('source_manifest_duplicate_identity')
+        all_expected_ids.update(expected)
+        if 'expected_manifest' in evaluation:
+            members = manifest_map(evaluation['expected_manifest'])
+            video_ids = evaluation.get('expected_video_ids', [])
+            if (set(members) != expected or len(video_ids) != len(set(video_ids))
+                    or set(video_ids) != {member['video_id'] for member in members.values()}
+                    or any(member.get('drama_id') not in (None, did) for member in members.values())):
+                raise PipelineError('drama_selection_identity_conflict')
+            for member in manifest_for_jobs(groups.get(did, [])):
+                check_result_identity(member, members[member['message_id']])
+            identities.update(members)
+        else:
+            # Old fixtures/reports can still run, but their missing historical
+            # identity is visible in the completion report rather than invented.
+            identities.update(manifest_map(manifest_for_jobs(groups.get(did, []))))
         if (scheduled != actual or not complete <= committed <= expected
                 or not scheduled <= expected):
             raise PipelineError('drama_selection_identity_conflict')
@@ -584,7 +672,21 @@ async def process_drama_pass(db, storage, cache, store, client, peer, source, jo
             if (evaluation.get('decision') != 'accept' or not expected
                     or expected - committed - scheduled or expected - complete - scheduled):
                 raise PipelineError('drama_selection_incomplete')
+    for evaluation in evaluations:
+        evaluation.update(max_missing_ratio=float(missing_ratio),
+                          delivery_finalized=(evaluation.get('planning_status') == 'already_complete'
+                                              and evaluation.get('decision') == 'accept'),
+                          delivery_stopped=False, delivery_interrupted=False,
+                          delivery_phase='queued' if evaluation.get('planning_status') == 'scheduled'
+                                         else 'not_scheduled')
     report_path = Path(report_path) if report_path else None
+    shared_stop = asyncio.Event()
+    abort = options.get('abort')
+    abort = abort if abort is not None else threading.Event()
+    options = {**options, 'abort': abort}
+    lifecycle_gate = Gate(concurrency, shared_stop)
+    flood_router = _FloodRouter(lifecycle_gate, shared_stop)
+    active_lanes = {}
     report = {'at': now(), 'status': 'in_progress', 'project_ref': project_ref,
               'requested': len(jobs), 'deferred': list(deferred), 'segments': [],
               'ai_called': False, 'dramas': evaluations,
@@ -596,65 +698,79 @@ async def process_drama_pass(db, storage, cache, store, client, peer, source, jo
               'already_complete_drama_count': sum(e.get('planning_status') == 'already_complete'
                                                   for e in evaluations),
               'quality_counts': dict(Counter(e.get('decision') for e in evaluations)),
+              'drama_concurrency': drama_concurrency, 'file_concurrency': concurrency,
+              'max_missing_ratio': float(missing_ratio),
               'pending_message_ids': [job[2]['message_id'] for job in jobs],
-              'active_drama_id': None, 'active_segment_report': None, 'stop_reason': None}
+              'active_drama_ids': [], 'active_drama_id': None,
+              'active_segment_reports': {}, 'active_segment_report': None, 'stop_reason': None}
     started, segment_number = time.monotonic(), 0
+
+    def active_compatibility():
+        contexts = list(report['active_segment_reports'].values())
+        active = contexts[-1] if contexts else {}
+        report.update(active_drama_id=active.get('drama_id'), active_segment_report=active.get('path'),
+                      active_segment_message_ids=active.get('message_ids', []),
+                      active_segment_drama_id=active.get('drama_id'),
+                      active_segment_retry_round=active.get('retry_round', 0))
 
     def save():
         latest = {entry['message_id']: entry for part in report['segments']
                   for entry in part.get('videos', [])}
-        report['elapsed_seconds'] = round(time.monotonic() - started, 1)
-        report['counts'] = dict(Counter(entry['result'] for entry in latest.values()))
-        report['cover_counts'] = dict(Counter(entry.get('cover_result') for entry in latest.values()))
+        report.update(elapsed_seconds=round(time.monotonic() - started, 1),
+                      counts=dict(Counter(entry['result'] for entry in latest.values())),
+                      cover_counts=dict(Counter(entry.get('cover_result') for entry in latest.values())),
+                      active_drama_ids=list(active_lanes), peak_inflight_files=lifecycle_gate.peak,
+                      file_lifecycle_limit_now=lifecycle_gate.limit)
         report['pending_message_ids'] = [job[2]['message_id'] for job in jobs
             if (latest.get(job[2]['message_id'], {}).get('result') not in SUCCESS
                 or latest.get(job[2]['message_id'], {}).get('cover_result') not in COVER_SUCCESS)]
         for evaluation in evaluations:
-            expected = set(evaluation.get('expected_message_ids', []))
-            scheduled = set(evaluation.get('scheduled_message_ids', []))
-            cover_only_ids = set(evaluation.get('cover_only_message_ids', []))
-            # Explicit readback jobs must succeed in this pass; an older cloud
-            # commit cannot mask their failed verification.
-            video_done = set(evaluation.get('committed_message_ids', [])) - (scheduled - cover_only_ids)
-            cover_done = set(evaluation.get('complete_message_ids', [])) - scheduled
-            video_done.update(mid for mid in scheduled if latest.get(mid, {}).get('result') in SUCCESS)
-            cover_done.update(mid for mid in scheduled
-                              if latest.get(mid, {}).get('cover_result') in COVER_SUCCESS)
-            work_left = {mid for mid in scheduled
-                         if latest.get(mid, {}).get('result') not in SUCCESS
-                         or latest.get(mid, {}).get('cover_result') not in COVER_SUCCESS}
-            remaining = expected - video_done | expected - cover_done | work_left
-            video_complete, cover_complete = bool(expected) and expected <= video_done, bool(expected) and expected <= cover_done
-            status = evaluation.get('planning_status')
-            if status == 'rejected':
-                state = 'rejected'
-            elif status == 'pending':
-                state = 'metadata_pending'
-            elif status == 'deferred':
-                state = 'deferred'
-            elif video_complete and cover_complete and not work_left:
-                state = 'complete'
-            elif report['active_drama_id'] == evaluation['drama_id']:
-                state = 'in_progress'
-            else:
-                state = 'incomplete' if any(mid in latest for mid in scheduled) else 'queued'
-            evaluation.update(state=state, video_complete=video_complete,
-                              cover_complete=cover_complete, remaining_message_ids=sorted(remaining),
-                              remaining_video_message_ids=sorted(expected - video_done),
-                              remaining_cover_message_ids=sorted(expected - cover_done))
+            did = evaluation['drama_id']
+            evaluation.update(drama_progress(evaluation, report['segments'], SUCCESS, COVER_SUCCESS,
+                                             did if did in active_lanes else None))
+        selected = [e for e in evaluations if e.get('planning_status') in ('scheduled', 'already_complete')]
+        waiting = any(e.get('planning_status') in ('pending', 'deferred') for e in evaluations)
+        report['delivery_counts'] = dict(Counter(e.get('delivery_decision', 'pending') for e in evaluations))
+        report['delivery_accepted'] = bool(selected) and not waiting and all(e.get('delivery_accepted') is True
+                                                                          for e in selected)
         if report_path:
             atomic_json(report_path, report)
+        if outcome_path is not None:
+            from video_archive.pipeline.outcomes import write_outcomes
+            write_outcomes(outcome_path, project_ref, evaluations)
+
+    async def wait_retry():
+        if shared_stop.is_set():
+            return False
+        sleeper = asyncio.create_task(asyncio.sleep(30))
+        stopper = asyncio.create_task(shared_stop.wait())
+        try:
+            await asyncio.wait((sleeper, stopper), return_when=asyncio.FIRST_COMPLETED)
+            return not shared_stop.is_set()
+        finally:
+            for task in (sleeper, stopper):
+                if not task.done():
+                    task.cancel()
+            await asyncio.gather(sleeper, stopper, return_exceptions=True)
 
     async def run_group(did, members, retry_round=0):
         nonlocal segment_number
-        report.update(active_drama_id=did, status='in_progress')
         for offset in range(0, len(members), batch_size):
+            if shared_stop.is_set():
+                return False
             segment_number += 1
             suffix = (f'-retry-{retry_round}' if retry_round else '') + f'-segment-{segment_number}.json'
             segment_path = report_path.with_name(report_path.stem + suffix) if report_path else None
-            report['active_segment_report'] = str(segment_path) if segment_path else None
+            segment_jobs = members[offset:offset + batch_size]
+            context = {'path': str(segment_path) if segment_path else None,
+                       'message_ids': [job[2]['message_id'] for job in segment_jobs],
+                       'drama_id': did, 'retry_round': retry_round}
+            report['active_segment_reports'][did] = context
+            active_compatibility()
             save()
-            part_options = {**options, 'cover_only': set(by_drama[did].get('cover_only_message_ids', []))}
+            part_options = {**options, 'cover_only': set(by_drama[did].get('cover_only_message_ids', [])),
+                            'lifecycle_gate': lifecycle_gate, 'shared_stop': shared_stop,
+                            'flood_router': flood_router}
             if retry_round:
                 latest = {entry['message_id']: entry for part in report['segments']
                           for entry in part.get('videos', [])}
@@ -663,53 +779,108 @@ async def process_drama_pass(db, storage, cache, store, client, peer, source, jo
                                         job[2]['message_id'] for job in members
                                         if latest.get(job[2]['message_id'], {}).get('result') in SUCCESS})
             part = await process_batch(db, storage, cache, store, client, peer, source,
-                                       members[offset:offset + batch_size], report_path=segment_path,
+                                       segment_jobs, report_path=segment_path,
                                        project_ref=project_ref, **part_options)
-            part['drama_id'] = did
+            check_segment(part, identities, set(context['message_ids']), project_ref)
+            part.update(drama_id=did, segment_report=str(segment_path) if segment_path else None)
             if retry_round:
                 part['retry_round'] = retry_round
             report['segments'].append(part)
-            if part.get('download_limit_now') is not None:
-                options['concurrency'] = part['download_limit_now']
-            save()
+            report['active_segment_reports'].pop(did, None)
+            active_compatibility()
             if part.get('stop_reason'):
-                report.update(status='stopped', stop_reason=part['stop_reason'], active_drama_id=None)
+                shared_stop.set()
+                report.update(status='stopped', stop_reason=report.get('stop_reason') or part['stop_reason'])
+            save()
+            if shared_stop.is_set():
                 return False
-        report['active_drama_id'] = None
-        save()
         return True
 
-    save()
-    try:
-        for did, members in groups.items():
-            if not await run_group(did, members):
-                return report
-        for retry_round in range(1, retry_rounds + 1):
-            latest = {entry['message_id']: entry for part in report['segments']
-                      for entry in part.get('videos', [])}
-            retry_groups = {did: [job for job in members
-                            if latest.get(job[2]['message_id'], {}).get('result') not in SUCCESS
-                            or latest.get(job[2]['message_id'], {}).get('cover_result') not in COVER_SUCCESS]
-                            for did, members in groups.items()}
-            retry_groups = {did: members for did, members in retry_groups.items() if members}
-            if not retry_groups:
-                break
-            report['status'] = 'retry_backoff'
+    queue = iter(groups.items())
+    async def drama_worker():
+        for did, members in queue:
+            if shared_stop.is_set():
+                return
+            evaluation = by_drama[did]
+            active_lanes[did] = True
+            evaluation['delivery_phase'] = 'transferring'
             save()
-            await asyncio.sleep(30)
-            for did, members in retry_groups.items():
-                if not await run_group(did, members, retry_round):
-                    return report
+            try:
+                if not await run_group(did, members):
+                    evaluation.update(delivery_stopped=True, delivery_finalized=False)
+                    return
+                for retry_round in range(1, retry_rounds + 1):
+                    latest = {entry['message_id']: entry for part in report['segments']
+                              for entry in part.get('videos', [])}
+                    retry_jobs = [job for job in members
+                                  if latest.get(job[2]['message_id'], {}).get('result') not in SUCCESS
+                                  or latest.get(job[2]['message_id'], {}).get('cover_result') not in COVER_SUCCESS]
+                    if not retry_jobs:
+                        break
+                    evaluation.update(delivery_phase='retry_backoff', retry_round=retry_round)
+                    save()
+                    if not await wait_retry():
+                        evaluation.update(delivery_stopped=True, delivery_finalized=False)
+                        return
+                    evaluation['delivery_phase'] = 'repairing'
+                    if not await run_group(did, retry_jobs, retry_round):
+                        evaluation.update(delivery_stopped=True, delivery_finalized=False)
+                        return
+                if shared_stop.is_set():
+                    evaluation.update(delivery_stopped=True, delivery_finalized=False)
+                    return
+                evaluation.update(delivery_finalized=True, delivery_phase='finalized')
+                save()
+                if evaluation.get('delivery_decision') == 'pending':
+                    evaluation.update(delivery_finalized=False, delivery_phase='waiting')
+                    # This lane is not free: a live lease or an unattempted file
+                    # needs a later repair pass, not another drama in this slot.
+                    return
+            except BaseException:
+                evaluation.update(delivery_interrupted=True, delivery_finalized=False)
+                raise
+            finally:
+                active_lanes.pop(did, None)
+                save()
+
+    workers = []
+    previous_flood = archive.on_flood
+    save()
+    archive.on_flood = flood_router
+    try:
+        workers = [asyncio.create_task(drama_worker()) for _ in range(min(drama_concurrency, len(groups)))]
+        await asyncio.gather(*workers)
         save()
-        incomplete = any(e.get('planning_status') == 'scheduled' and e['state'] != 'complete'
-                         for e in evaluations)
-        waiting = bool(deferred) or any(e.get('planning_status') in ('pending', 'deferred')
-                                       for e in evaluations)
-        report['status'] = 'incomplete' if incomplete else ('normal_queue_archived' if waiting else 'all_archived')
-    except BaseException:
-        report.update(status='interrupted', active_drama_id=None)
+        selected = [e for e in evaluations if e.get('planning_status') in ('scheduled', 'already_complete')]
+        if shared_stop.is_set():
+            report['status'] = 'stopped'
+        elif any(e.get('delivery_decision') == 'rejected_incomplete' for e in selected):
+            report['status'] = 'incomplete'
+        elif (any(e.get('planning_status') in ('pending', 'deferred') for e in evaluations)
+              or any(e.get('delivery_decision') == 'pending' for e in selected) or deferred):
+            report['status'] = 'normal_queue_archived'
+        elif any(e.get('delivery_decision') == 'accepted_with_gaps' for e in selected):
+            report['status'] = 'accepted_with_gaps'
+        elif any(not e.get('cover_complete') for e in selected):
+            report['status'] = 'delivery_accepted_cover_pending'
+        else:
+            report['status'] = 'all_archived'
+    except BaseException as exc:
+        abort.set()
+        shared_stop.set()
+        for worker in workers:
+            worker.cancel()
+        await asyncio.gather(*workers, return_exceptions=True)
+        if report_path:
+            try:
+                recover_active_segment(report, report_path, project_ref)
+            except PipelineError as recovery_error:
+                report['active_segment_recovery_error'] = str(recovery_error)
+        report.update(status='interrupted', failure_reason=error_code(exc))
         raise
     finally:
+        if archive.on_flood is flood_router:
+            archive.on_flood = previous_flood
         save()
     return report
 

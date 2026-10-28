@@ -15,6 +15,7 @@ from video_archive.core import StopArchive, Store, filename, record_message
 from video_archive.pipeline.batch import (_plan_files as plan, process_batch, process_drama_pass,
                                           retry_plan_dramas, plan_dramas, claim_blocker)
 from video_archive.screening.quality import QualityPolicy
+from video_archive.pipeline.completion import manifest_for_jobs
 from video_archive.pipeline.cache import Cache
 from video_archive.pipeline.common import PipelineError
 from test_pipeline import fixture
@@ -183,9 +184,10 @@ class SchedulingTests(unittest.TestCase):
             mids = [j[2]['message_id'] for j in args[7]]
             retrying = kwargs.get('resume_partials', False)
             calls.append((mids, retrying))
-            return {'videos': [{'message_id': mid,
+            return {'videos': [{**member,
                                 'result': 'uploaded_readback_verified' if retrying else 'failed',
-                                'cover_result': 'no_thumbnail'} for mid in mids],
+                                'cover_result': 'no_thumbnail'}
+                               for member in manifest_for_jobs(args[7])],
                     'download_limit_now': 4, 'stop_reason': None}
         async def no_delay(*args): pass
         async def run():
@@ -311,8 +313,8 @@ class SchedulingTests(unittest.TestCase):
         async def segment(*args, **kwargs):
             batch = args[7]
             calls.extend(x[2]['message_id'] for x in batch)
-            return {'videos': [{'message_id': x[2]['message_id'], 'result': 'failed',
-                                'cover_result': 'no_thumbnail'} for x in batch],
+            return {'videos': [{**member, 'result': 'failed', 'cover_result': 'no_thumbnail'}
+                               for member in manifest_for_jobs(batch)],
                     'download_limit_now': 1, 'stop_reason': None}
         async def run():
             with tempfile.TemporaryDirectory() as tmp:

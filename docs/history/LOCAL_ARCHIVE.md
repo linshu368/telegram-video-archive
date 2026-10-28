@@ -1,12 +1,12 @@
 # 本地归档流程历史记录
 
-以下正文从原 README 完整迁入，保留当时的运行事实、命令和验收范围。当前入口与目录见 [README](/Users/qianpeijia/Documents/ChatGPT/短剧/telegram-video-archive/README.md) 和 [项目结构](/Users/qianpeijia/Documents/ChatGPT/短剧/telegram-video-archive/docs/STRUCTURE.md)。
+以下正文从原 README 完整迁入，保留当时的运行事实、命令和验收范围。当前入口与目录见 [README](../../README.md) 和 [项目结构](../STRUCTURE.md)。
 
 ## 原归档流程与历史说明
 
 独立的命令行工具。只读取用户确认的单个频道/群历史，不监听新消息，不做后续增量，不发送机器人指令，不自动加入群或付费。原 archive.py 保持本地归档；新增 pipeline.py 仅显式执行 Supabase 迁移、清单导入和两个已有样本归档，不自动启动全量。
 
-设计基线：[双流程与 Supabase 存储/表结构](/Users/qianpeijia/Documents/ChatGPT/短剧/telegram-video-archive/docs/SUPABASE_PIPELINE_DESIGN.md)。实现与安全操作说明：[PIPELINE.md](/Users/qianpeijia/Documents/ChatGPT/短剧/telegram-video-archive/docs/PIPELINE.md)。**代码及本机离线/数据库验证已实施，真实 Supabase 验收尚未执行，真实 AI 适配器尚未确定。** 以下历史验收记录不是本次云端验收。
+设计基线：[双流程与 Supabase 存储/表结构](../SUPABASE_PIPELINE_DESIGN.md)。实现与安全操作说明：[PIPELINE.md](../PIPELINE.md)。**代码及本机离线/数据库验证已实施，真实 Supabase 验收尚未执行，真实 AI 适配器尚未确定。** 以下历史验收记录不是本次云端验收。
 
 ## 当前下载策略（2026-10-20）
 
@@ -26,8 +26,8 @@
 重建环境：
 
 ```sh
-python3 -m venv /Users/qj/python_project/telegram-video-archive/.venv
-/Users/qj/python_project/telegram-video-archive/.venv/bin/python -m pip install -r /Users/qj/python_project/telegram-video-archive/requirements.lock
+python3 -m venv .venv
+python -m pip install -r requirements.lock
 HOMEBREW_NO_AUTO_UPDATE=1 /opt/homebrew/bin/brew install ffmpeg
 ```
 
@@ -36,8 +36,8 @@ HOMEBREW_NO_AUTO_UPDATE=1 /opt/homebrew/bin/brew install ffmpeg
 在本机 Terminal / VS Code 集成终端运行，不要把验证码、API hash、密码或 session 发给助手：
 
 ```sh
-/Users/qj/python_project/telegram-video-archive/.venv/bin/python /Users/qj/python_project/telegram-video-archive/archive.py login
-/Users/qj/python_project/telegram-video-archive/.venv/bin/python /Users/qj/python_project/telegram-video-archive/archive.py resolve --confirm
+python archive.py login
+python archive.py resolve --confirm
 ```
 
 第一条依次询问 API ID、API hash、国际格式手机号、验证码及可能的两步验证密码。除 API ID 外均隐藏输入。验证码和密码不落盘；API 凭证与 session 保存在 `/Users/qj/python_project/telegram-video-archive/.private/`（目录 0700，文件 0600，已忽略版本控制）。不复用项目外 session。
@@ -47,7 +47,7 @@ HOMEBREW_NO_AUTO_UPDATE=1 /opt/homebrew/bin/brew install ffmpeg
 也可以只解析：
 
 ```sh
-/Users/qj/python_project/telegram-video-archive/.venv/bin/python /Users/qj/python_project/telegram-video-archive/archive.py resolve
+python archive.py resolve
 ```
 
 若邀请已失效、尚未加入或实际目标不明确，停止并提供准确可访问链接/ID。`resolve --entry '准确链接或ID' --confirm` 可替换入口。绝不自动加入、续费或跳转到相似群。已有白名单不会被不同来源覆盖。Desktop 的登录不等于本工具的 API 登录。
@@ -57,8 +57,8 @@ HOMEBREW_NO_AUTO_UPDATE=1 /opt/homebrew/bin/brew install ffmpeg
 ## 2. 小样本 → 全量（同一任务，同一上界）
 
 ```sh
-/Users/qj/python_project/telegram-video-archive/.venv/bin/python /Users/qj/python_project/telegram-video-archive/archive.py sample
-/Users/qj/python_project/telegram-video-archive/.venv/bin/python /Users/qj/python_project/telegram-video-archive/archive.py backfill
+python archive.py sample
+python archive.py backfill
 ```
 
 `sample` **先只扫描完整历史元数据**，再选约 3 个代表性视频下载：优先文件附件、缺少标题/标签/简介、相册或回复关系；不存在的类别不伪造。少于 3 个则验证现有视频。完整元数据扫描能保留关联文字及得出容量估计，不是提前下载全量视频。
@@ -71,16 +71,16 @@ HOMEBREW_NO_AUTO_UPDATE=1 /opt/homebrew/bin/brew install ffmpeg
 
 ```sh
 # Ctrl-C、SIGTERM、网络中断或容量不足后：同一目录、同一上界
-/Users/qj/python_project/telegram-video-archive/.venv/bin/python /Users/qj/python_project/telegram-video-archive/archive.py resume
+python archive.py resume
 
 # 仅重试 failed 状态，不重新扫描已完成历史
-/Users/qj/python_project/telegram-video-archive/.venv/bin/python /Users/qj/python_project/telegram-video-archive/archive.py retry
+python archive.py retry
 
 # 离线重算成功文件的大小/hash/媒体探测，并完整解码样本
-/Users/qj/python_project/telegram-video-archive/.venv/bin/python /Users/qj/python_project/telegram-video-archive/archive.py verify
+python archive.py verify
 
 # 仅重新导出状态及报告，不声称重新校验文件
-/Users/qj/python_project/telegram-video-archive/.venv/bin/python /Users/qj/python_project/telegram-video-archive/archive.py report
+python archive.py report
 ```
 
 `resume` 包括 pending、downloading、failed 的恢复，并复核 success 后跳过。`retry` 仅处理 failed；遇到安全停止而保持 pending 的项请用 `resume`。不实现字节级续传：`.part` 下次重新下载。成功文件不跨来源消息合并，即使原始名字或 SHA-256 相同，也保留每条消息记录和独立稳定路径。每次命令有项目级锁，不能同时运行登录/下载两个进程。
@@ -130,7 +130,7 @@ HOMEBREW_NO_AUTO_UPDATE=1 /opt/homebrew/bin/brew install ffmpeg
 用户撤销“不绕过内容保护”的要求后，可显式运行：
 
 ```sh
-/Users/qj/python_project/telegram-video-archive/.venv/bin/python /Users/qj/python_project/telegram-video-archive/probe_download.py --attempt-protected
+python scripts/diagnostics/probe_download.py --attempt-protected
 ```
 
 此命令保留 `noforwards` 原值，但不因该标志在本地拒绝调用标准用户 API 的 `download_media`。仅使用已登录用户和已确认的单来源白名单，最多读取 10 页（每页最多 100 条）寻找一个非限时视频，只尝试该视频一次；下载限时 600 秒。服务端拒绝时记录错误，不尝试其他权限、来源或转发路径。技术上能够下载不代表拥有转载或分发授权。
@@ -142,7 +142,7 @@ HOMEBREW_NO_AUTO_UPDATE=1 /opt/homebrew/bin/brew install ffmpeg
 ## 话题目录与短剧索引（纯元数据）
 
 ```sh
-/Users/qj/python_project/telegram-video-archive/.venv/bin/python /Users/qj/python_project/telegram-video-archive/topic_metadata.py
+python topic_metadata.py
 ```
 
 沿用本项目用户 session、单进程锁、白名单与有限 RPC 重试，并额外限定来源 ID
@@ -201,7 +201,7 @@ ByID 查询、选定话题 GetReplies 结果及既有探测媒体身份一致。
 离线验收命令（不会联网或重复下载；补充导出和审计不修改原采集时间/结果）：
 
 ```sh
-/Users/qj/python_project/telegram-video-archive/.venv/bin/python /Users/qj/python_project/telegram-video-archive/validate_topic_metadata.py /Users/qj/python_project/telegram-video-archive/archive/topics-20261019-184029-928673
+python scripts/validation/validate_topic_metadata.py archive/topics-20261019-184029-928673
 ```
 
 验收文件：上述目录的 `acceptance.json` 和 `selected-video-evidence.json`。
@@ -220,9 +220,8 @@ ByID 查询、选定话题 GetReplies 结果及既有探测媒体身份一致。
 ## 开发验证
 
 ```sh
-cd /Users/qj/python_project/telegram-video-archive
-/Users/qj/python_project/telegram-video-archive/.venv/bin/python -m unittest discover -s /Users/qj/python_project/telegram-video-archive/tests -v
-/Users/qj/python_project/telegram-video-archive/.venv/bin/python -m pip check
+python -m unittest discover -s tests -v
+python -m pip check
 ```
 
 文档核实依据（本次实现查询的稳定版为 1.45.0；Telethon v1 是持续更新 API 层/修复的维护版本）：

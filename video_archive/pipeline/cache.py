@@ -7,8 +7,8 @@ import sqlite3
 from contextlib import contextmanager
 from pathlib import Path
 
-from core import sha256
-from pipeline_common import PipelineError, identity, object_path
+from video_archive.core import sha256
+from video_archive.pipeline.common import PipelineError, identity, object_path
 
 
 class Cache:

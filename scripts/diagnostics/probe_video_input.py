@@ -12,18 +12,22 @@ video is inconclusive and needs a second opinion from you.
 Read-only: does not touch Lease/claim/finish, no pipeline/db state changes.
 
 Usage:
-    .venv/bin/python probe_video_input.py <path-to-video> [--seconds 12] [--width 480]
+    .venv/bin/python scripts/diagnostics/probe_video_input.py <path-to-video> [--seconds 12] [--width 480]
 """
 import argparse
 import base64
 import json
 import subprocess
 import sys
+from pathlib import Path
 import urllib.error
 import urllib.request
 
-from core import media_tools
-from pipeline_common import ai_config
+if __package__ in (None, ''):
+    sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+
+from video_archive.core import media_tools
+from video_archive.pipeline.common import ai_config
 
 
 def make_clip(path, seconds, width):

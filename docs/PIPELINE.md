@@ -1,6 +1,84 @@
 # v2 pipeline：实现、验收边界与操作
 
-## main 当前授权与恢复入口（2026-10-21，优先于下文历史说明）
+当前目录与脚本位置见 [项目结构](/Users/qianpeijia/Documents/ChatGPT/短剧/telegram-video-archive/docs/STRUCTURE.md)。代码按用途分组，下载队列按整剧推进；视频下载、上传、校验和缓存清理内核保持原实现。下文历史记录中的旧机器路径和运行事实不改写。
+
+## 源整剧下载前筛选（2026-10-28，当前入口）
+
+当前在 `plan/batch/run/retry` 前执行整剧筛选，并以整部剧为单位计划和推进下载。剧的完整成员以 **Telegram 原始话题在冻结边界内、当前 API 可访问的全部视频**为准，生产库、本地视频池和旧 `topics.json` 不决定剧清单。旧的数量与留存率需要重新扫描后计算。本轮没有执行真实源扫描、生产下载或部署；下文带日期的授权、运行状态和验收数量是历史记录。
+
+### 先收齐源信息，再离线评估
+
+使用既有登录、来源白名单和同一数据目录；如尚未配置，先按 README 完成 `login` 与 `resolve --confirm`。以下命令中的路径均为当前项目绝对路径：
+
+```sh
+"/Users/qianpeijia/Documents/ChatGPT/短剧/telegram-video-archive/.venv/bin/python" \
+  "/Users/qianpeijia/Documents/ChatGPT/短剧/telegram-video-archive/archive.py" \
+  --data "/Users/qianpeijia/Documents/ChatGPT/短剧/telegram-video-archive/archive" scan
+
+"/Users/qianpeijia/Documents/ChatGPT/短剧/telegram-video-archive/.venv/bin/python" \
+  "/Users/qianpeijia/Documents/ChatGPT/短剧/telegram-video-archive/pipeline.py" \
+  --data "/Users/qianpeijia/Documents/ChatGPT/短剧/telegram-video-archive/archive" \
+  plan --minimum-quality 720 \
+  --report "/Users/qianpeijia/Documents/ChatGPT/短剧/telegram-video-archive/archive/drama-quality-plan.json"
+```
+
+`archive.py scan` 是纯元数据入口：
+
+1. 沿用首次任务冻结的消息 ID 上界和排他 UTC 时间边界；未建任务时建立边界。按原全局历史分页机制扫描到空页，中断后从已提交游标恢复。
+2. 每次独立获取两遍源论坛的完整话题目录，核对话题集合及稳定计数（允许已知的 General 一条偏差）；不从已有 dramas/videos 反推话题。目录变化或计数异常时停止。排除 General 后，对每个源话题逐页调用 `GetReplies` 到空页，补充此前池子中没有的视频。
+3. 核对来源、请求话题与实际归属、消息 ID 上界和时间边界，记录每话题全部视频的媒体身份、大小、时长、宽高及完成证据。全局扫描和全部源话题均通过，才标记源完整性成功；失败会清除本轮成功标记，旧证据不能顶替失败的新扫描。
+
+扫描不下载视频或封面，不调用 `prepare_downloads`、下载器、FFmpeg、ffprobe 或媒体校验，也不重置已有视频下载状态。`scan` 的退出码 0 表示元数据阶段完成，不能解释为视频下载或验收完成；最终本地视频报告可以仍为 `INCOMPLETE`。
+
+本地 `state.sqlite3` 的 `topic_inventories` 保存每话题完成证据，任务记录保存完整源话题 ID 集合及共同边界；`source-topics.json` 和 `source-inventory-*` 目录保留此次源目录及分页审计。`plan/batch/run/retry` 要求这些证据全部有效，并据此构造完整成员快照。分页中断、空消息、来源/归属不明确、媒体身份变化或边界不一致时停止，不能退回旧池子继续筛选。元数据的宽高、时长或大小不足以计算画质时，该剧为 `pending`，等待补齐。
+
+这里的“完整”指当前账号在冻结范围内可通过 API 枚举的内容。Telegram 没有历史原子快照，已删除、不可见或扫描期间发生变化的内容不能保证被取得。
+
+### 画质规则：`drama_quality_v1`
+
+`video_archive/screening/quality.py` 对完整剧成员统一评估，返回 `accept/reject/pending`，不按判断结果删除单集。判定顺序如下：
+
+1. **画面方向。** 任一集 `width >= height`，整剧拒绝，包括方屏。竖屏只要求 `width < height`，不要求固定 9:16。已知横/方屏的拒绝优先于其他集的字段缺失；其余缺字段剧为 `pending`。
+2. **稳定剧。** 宽、高各自的 `(最大值 - 最小值) / 最大值 <= 10%`，且最高/最低码率 `<= 1.5`，取各集短边的中位数与 720p 等效码率的中位数判档。
+3. **差异较大的剧。** 先逐集判画质档。唯一主档占比 `>= 60%`，且低于主档的视频比例 `<= 10%`，采用该主档；否则使用最低分辨率档，并以该分辨率档内的等效码率中位数判档。比例按真实集数计算，1–9 集不能忽略 1 集，10 集才允许 1 集低质异常。
+
+分辨率取 `min(width, height)`。以下门槛同时满足才达到对应画质档，取能达到的最高档；容差固定为 10%：
+
+| 画质档 | 短边最低像素 | 720p 等效码率最低值 |
+|---|---:|---:|
+| 近 1080 | 972 | 1.5 Mbps |
+| 近 720 | 648 | 1.2 Mbps |
+| 近 480 | 432 | 0.8 Mbps |
+| 低于 480 | 不满足以上任一档 | — |
+
+默认最低要求是近 720 档，`--minimum-quality 480/720/1080` 可切换最低档。码率优先使用有效元数据；没有现成码率时按 `expected_size × 8 / duration_seconds` 估算平均 bps，再按 `bps × (720 × 1280) / (width × height) / 1,000,000` 换算等效 Mbps。已有已验证的本地探测结果可以补齐缺失声明字段，源声明字段优先。该值包含容器与音频等开销，是压缩程度的近似信号，不能视为视频流精确码率或感知画质评分；本轮不会为补字段预先下载文件。
+
+报告中 `evaluated_dramas` 是参与评估的有视频源剧数，`quality_decisions` 分别列出合格、拒绝和待补字段的剧数，`accepted_drama_videos` 是所有合格剧的完整视频数。每剧记录保留判定原因、档位、方法、缺字段数及完整 `expected_message_ids/expected_video_ids`。`eligible_before_cloud_check` 则是经过原下载条件后本次能进入正常队列的视频数，可能低于合格剧的视频总数；`deferred` 说明文件大小、partial 等延后原因。`plan` 只读本地源快照，不查云端是否已归档，不下载或上传媒体。
+
+### 按整部剧计划和下载
+
+完成源扫描后，先通过 `plan` 查看结果。`batch --drama-limit 1` 可只处理一部剧，不必同时指定 `--limit`：
+
+```sh
+"/Users/qianpeijia/Documents/ChatGPT/短剧/telegram-video-archive/.venv/bin/python" \
+  "/Users/qianpeijia/Documents/ChatGPT/短剧/telegram-video-archive/pipeline.py" \
+  --data "/Users/qianpeijia/Documents/ChatGPT/短剧/telegram-video-archive/archive" \
+  batch --drama-limit 1 --minimum-quality 720
+```
+
+- `--only` 和 `--first` 中的任一消息 ID 都会扩展到它所属整剧，质量判断始终使用完整成员。
+- `--limit` 表示本次待处理视频数量的软目标。当前剧始终完整纳入，达到目标后再停止接下一部，不会因剩余额度不足而拒绝当前整剧，也不截取前几集。`--drama-limit N` 直接限制本次剧数。
+- 剧内保留现有并发；默认每段 100 个视频，`--batch-size` 上限提高到 500。一部剧的全部分段尝试完成后，才会进入下一部；大剧可跨多个分段，分段不改变整剧单位。
+- 普通单集失败时，整剧记为 `incomplete`，保留失败和未完成成员清单，再处理后续剧；限流、磁盘或数据库等硬停止条件会停止队列。
+- 完成判断覆盖整剧全部预期成员，并结合云端已经完成的成员核对。视频和封面完成状态分别记录，单段结束或部分上传不能冒充整剧完成。报告的 `scheduled_drama_count` 是本轮实际安排的剧数，`already_complete_drama_count` 是无需再处理的剧数，`selected_drama_count` 包含二者。
+
+视频下载、媒体身份检查、上传、读回校验、租约和缓存清理沿用原实现。文件大小上限、已有 partial 和明确延后成员仍受原条件约束；任一待处理成员被这些条件挡住时，整部剧暂缓，不只放行其他集。
+
+`batch/run/retry` 每次先验证源完整性并重新执行质量关口。重试从同一项目报告恢复整剧待办，默认沿用保存的质量策略，并继续遵守数据库租约、退避和尝试次数限制。不要用旧 `archive.py sample/backfill/resume/retry` 代替此流程，它们保留原本地归档用途，不套用新筛选或整剧调度。独立样本、清单导入与 AI 命令保持原用途，也不代表已通过新下载筛选。
+
+本次目录整理和离线验证没有运行真实 Telegram 扫描或生产下载。实际源清单、合格数量和下载结果需在配置正确后执行对应命令取得。
+
+## main 授权与恢复入口历史记录（2026-10-21）
 
 当前实际状态（2026-10-21 16:31）：main表/角色/私有桶已建成；唯一一次启动PID65100已在领取前因urllib_URLError退出，当前无worker、锁空闲。刚补只读GET/HEAD最多3次请求建立重试以及权限门的有界连接重试，尚未在main重启验证。不要重跑初始化。最新事实和绝对报告路径见 `/Users/qj/python_project/telegram-video-archive/PROGRESS_HANDOFF.md` 顶部。
 
@@ -20,7 +98,7 @@
 - Storage 401/403、资源冲突、持续数据库不可用、磁盘/缓存底线或长限流停止新领取；单文件失败保留记录并继续。短暂数据库连接错误在新健康查询成功时不停止整个队列。
 - 原始资料、校验记录、3021和其他旧part以及6558/6559保护原件继续保留；test对象和成功标记不迁移到main。无真实AI、常驻或增量服务。
 
-## 当前入口与边界（2026-10-20 更新）
+## 入口与边界历史记录（2026-10-20）
 
 - 用户已确认样本门槛为 6558、6559。旧 SQLite 的 `sample_passed=false` 保留，禁止用旧 `archive.py backfill/resume` 启动云端全量。
 - 新 `batch` 明确限制最多 100 个；新 `run` 在同一进程、同一项目锁和 Telegram 连接下分段处理有限清单，不是常驻服务。当前仅授权 test 的六条验收，main 全量仍需明确确认。
@@ -157,8 +235,8 @@ chmod 700 /Users/qj/python_project/telegram-video-archive/.private
 
 `pipeline.py ai [--limit N]` 已接线：候选集合 = 本地清单中 message_id 落在云端 `archived_messages()`（即 upload 已提交）的视频，不新增 SQL 函数。每个候选直接尝试 `run_ai`；`claim()` 已有的条件（ai 阶段 pending/失败退避/过期租约、attempts 上限）决定是否真正执行，不可领取时该条记为 `skipped`，单条失败记为 `failed` 并继续下一条，不做常驻调度/批量重试。
 
-- `pipeline_ai.py`：`extract_frames()` 用 ffmpeg 按时长均匀抽帧（默认 6 帧、长边 768px，避开首尾 5% 的片头/片尾）。`call_model()` 是唯一的网络调用入口：POST `base_url + '/chat/completions'`（OpenAI chat completions 兼容格式），帧以 `data:image/jpeg;base64,...` 形式随系统提示词一起发送，系统提示词取自项目根目录 `prompt.md`（非密钥，明文文件）。响应内容按 ```` ```json ```` 围栏做宽松解析后 `json.loads`，再交给 `ai_output()` 做唯一的严格字段校验。任何 HTTP/JSON 异常都走现有 `error_code()`，不记录密钥或响应正文。
-- 密钥与模型参数在独立文件 `.private/ai.json`（0600，与 `.private/pipeline.json` 权限模型一致，示例见 `pipeline.ai.config.example.json`），由 `pipeline_common.ai_config()` 校验：`provider`/`model`/`api_key`/`base_url` 必填，`base_url` 必须是 `https://`；`frame_count`(1-20，默认6)、`max_dim`(64-2048，默认768)、`request_timeout`(10-600秒，默认120) 有范围检查。
+- `pipeline_ai.py`：`extract_frames()` 用 ffmpeg 按时长均匀抽帧（默认 6 帧、长边 768px，避开首尾 5% 的片头/片尾）。`call_model()` 是唯一的网络调用入口：POST `base_url + '/chat/completions'`（OpenAI chat completions 兼容格式），帧以 `data:image/jpeg;base64,...` 形式随系统提示词一起发送，系统提示词取自 `prompts/prompt.md`（非密钥，明文文件）。响应内容按 ```` ```json ```` 围栏做宽松解析后 `json.loads`，再交给 `ai_output()` 做唯一的严格字段校验。任何 HTTP/JSON 异常都走现有 `error_code()`，不记录密钥或响应正文。
+- 密钥与模型参数在独立文件 `.private/ai.json`（0600，与 `.private/pipeline.json` 权限模型一致，示例见 `config/examples/pipeline.ai.config.example.json`），由 `pipeline_common.ai_config()` 校验：`provider`/`model`/`api_key`/`base_url` 必填，`base_url` 必须是 `https://`；`frame_count`(1-20，默认6)、`max_dim`(64-2048，默认768)、`request_timeout`(10-600秒，默认120) 有范围检查。
 - 当前配置的 provider 是一个 OpenAI 兼容网关（`api.surplusintelligence.ai`），模型 `gemini-3.5-flash-lite`；这是用户提供的第三方代理服务，不是 Anthropic/OpenAI/Google 官方直连，费用和可用性以该服务为准，程序不做额外验证。
 
 ## 测试

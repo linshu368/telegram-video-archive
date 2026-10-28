@@ -12,8 +12,8 @@ from pathlib import Path
 from unittest.mock import AsyncMock, Mock, patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-import archive
-from core import (Store, StopArchive, classify, clean, cover_filename, disk_check,
+import video_archive.telegram.archive as archive
+from video_archive.core import (Store, StopArchive, classify, clean, cover_filename, disk_check,
                   filename, pick_thumb, record_message, validate_cover, validate_file)
 from telethon import errors, types
 
@@ -122,7 +122,7 @@ class ArchiveTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual([t['type'] for t in record['thumbs']], ['m', 'x'])
         client = FakeClient(msgs, self.content)
         cover = self.store.cover(10)
-        with patch('core.media_tools', side_effect=AssertionError('covers must not touch ffmpeg')):
+        with patch('video_archive.core.media_tools', side_effect=AssertionError('covers must not touch ffmpeg')):
             result = await archive.download_cover(client, None, self.store, record, cover)
         self.assertEqual(result, 'downloaded_success')
         # Index 2 in doc.thumbs: the stripped inline blur at index 0 is not fetchable.
@@ -293,7 +293,7 @@ class ArchiveTests(unittest.IsolatedAsyncioTestCase):
             nonlocal calls
             calls += 1
             raise ConnectionError()
-        with patch('archive.asyncio.sleep', return_value=None):
+        with patch('video_archive.telegram.archive.asyncio.sleep', return_value=None):
             with self.assertRaises(ConnectionError):
                 await archive.rpc(broken)
         self.assertEqual(calls, 3)
@@ -321,7 +321,7 @@ class ArchiveTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(report['reconciliation_ok'])
 
     def test_disk_deficit(self):
-        with patch('core.shutil.disk_usage', return_value=shutil._ntuple_diskusage(100, 99, 1)):
+        with patch('video_archive.core.shutil.disk_usage', return_value=shutil._ntuple_diskusage(100, 99, 1)):
             with self.assertRaisesRegex(StopArchive, 'deficit='):
                 disk_check(self.store.root, 100)
 
@@ -332,11 +332,11 @@ class ArchiveTests(unittest.IsolatedAsyncioTestCase):
         client.is_bot.return_value = False
         protected = {**SOURCE, 'protected': True}
         args = archive.parser().parse_args(['sample'])
-        with patch('archive.load_config', return_value={}), \
-                patch('archive.client_for', return_value=client), \
-                patch('archive.confirmed_target', new=AsyncMock(return_value=(None, protected))), \
-                patch('archive.ensure_task', new=AsyncMock()) as ensure, \
-                patch('archive.scan', new=AsyncMock(side_effect=StopArchive('scan_reached'))) as scan:
+        with patch('video_archive.telegram.archive.load_config', return_value={}), \
+                patch('video_archive.telegram.archive.client_for', return_value=client), \
+                patch('video_archive.telegram.archive.confirmed_target', new=AsyncMock(return_value=(None, protected))), \
+                patch('video_archive.telegram.archive.ensure_task', new=AsyncMock()) as ensure, \
+                patch('video_archive.telegram.archive.scan', new=AsyncMock(side_effect=StopArchive('scan_reached'))) as scan:
             with self.assertRaisesRegex(StopArchive, 'scan_reached'):
                 await archive.execute(args, self.store)
             ensure.assert_awaited_once()
@@ -460,7 +460,7 @@ class ArchiveTests(unittest.IsolatedAsyncioTestCase):
             finally:
                 active -= 1
 
-        with patch('archive.download_one', side_effect=worker):
+        with patch('video_archive.telegram.archive.download_one', side_effect=worker):
             with self.assertRaisesRegex(StopArchive, 'test_stop'):
                 await asyncio.wait_for(archive.download_set(None, None, SOURCE, self.store, {}), 2)
         self.assertEqual(peak, 2)

@@ -5,8 +5,8 @@ layout changes. Used to fix up videos uploaded before faststart was enforced.
 """
 import subprocess
 
-from core import media_tools, sha256
-from pipeline_common import PipelineError
+from video_archive.core import media_tools, sha256
+from video_archive.pipeline.common import PipelineError
 
 TIMEOUT = 1800
 

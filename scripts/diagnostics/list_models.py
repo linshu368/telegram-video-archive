@@ -1,5 +1,10 @@
 import json
+import sys
+from pathlib import Path
 import urllib.request
+
+if __package__ in (None, ''):
+    sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
 d = json.load(open('.private/ai.json'))
 req = urllib.request.Request(d['base_url'] + '/models', headers={'Authorization': 'Bearer ' + d['api_key']})

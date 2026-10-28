@@ -13,10 +13,13 @@ import sys
 from decimal import Decimal, ROUND_HALF_UP
 from pathlib import Path
 
+if __package__ in (None, ''):
+    sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+
 import psycopg
 from psycopg.conninfo import conninfo_to_dict
 
-BASE = Path(__file__).resolve().parent
+from video_archive.paths import BASE
 MAIN_REF = 'wbtsfzozlmurljvglhpn'
 INT_MAX = 2_147_483_647
 

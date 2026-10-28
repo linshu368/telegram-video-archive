@@ -11,27 +11,30 @@ from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-from core import StopArchive, Store, filename, record_message
-from pipeline_batch import plan, process_batch, process_pass, retry_plan, claim_blocker
-from pipeline_cache import Cache
-from pipeline_common import PipelineError
+from video_archive.core import StopArchive, Store, filename, record_message
+from video_archive.pipeline.batch import (_plan_files as plan, process_batch, process_drama_pass,
+                                          retry_plan_dramas, plan_dramas, claim_blocker)
+from video_archive.screening.quality import QualityPolicy
+from video_archive.pipeline.cache import Cache
+from video_archive.pipeline.common import PipelineError
 from test_pipeline import fixture
 from test_archive import FakeClient, SOURCE, message
 
 
-def jobs(count=3):
+def jobs(count=3, *, separate_dramas=False):
     result = []
     for mid in range(101, 101 + count):
-        drama, video = fixture(mid)
+        drama, video = fixture(mid, topic=mid if separate_dramas else 20)
         record = {'message_id': mid, 'expected_size': 10, 'source': {'id': -100123},
-                  'media_id': 9000 + mid, 'original_filename': 'fixture.mp4'}
+                  'media_id': 9000 + mid, 'original_filename': 'fixture.mp4',
+                  'width': 720, 'height': 1280, 'bitrate_bps': 2_000_000}
         result.append((drama, video, record, {'status': 'pending'}))
     return result
 
 
 class SchedulingTests(unittest.TestCase):
     def test_retry_is_project_scoped_latest_evidence_only_and_deferred_is_explicit(self):
-        rows = jobs(3)
+        rows = jobs(3, separate_dramas=True)
         with tempfile.TemporaryDirectory() as tmp:
             path = Path(tmp) / 'report.json'
             done = 'cover_uploaded_readback_verified'
@@ -42,23 +45,23 @@ class SchedulingTests(unittest.TestCase):
                              'cover_result': done}]}],
                 'deferred': [{'message_id': 103, 'reason': 'large_video'}]}
             path.write_text(json.dumps(report))
-            selected, _ = retry_plan(rows, tmp, path, 'a'*20)
+            selected, _, _ = retry_plan_dramas(rows, tmp, path, 'a'*20, quality_policy=QualityPolicy())
             self.assertEqual([j[2]['message_id'] for j in selected], [102])
-            selected, _ = retry_plan(rows, tmp, path, 'a'*20, include_deferred=True)
+            selected, _, _ = retry_plan_dramas(rows, tmp, path, 'a'*20, quality_policy=QualityPolicy(), include_deferred=True)
             self.assertEqual([j[2]['message_id'] for j in selected], [102, 103])
             with self.assertRaisesRegex(PipelineError, 'project_mismatch'):
-                retry_plan(rows, tmp, path, 'b'*20)
+                retry_plan_dramas(rows, tmp, path, 'b'*20, quality_policy=QualityPolicy())
 
     def test_cover_failure_alone_reselects_an_archived_video(self):
         """The two tracks retry independently: a committed video with no cover is work."""
-        rows = jobs(2)
+        rows = jobs(2, separate_dramas=True)
         with tempfile.TemporaryDirectory() as tmp:
             path = Path(tmp) / 'report.json'
             path.write_text(json.dumps({'project_ref': 'a'*20, 'segments': [{'videos': [
                 {'message_id': 101, 'result': 'uploaded_readback_verified', 'cover_result': 'failed'},
                 {'message_id': 102, 'result': 'uploaded_readback_verified',
                  'cover_result': 'cover_uploaded_readback_verified'}]}]}))
-            selected, _ = retry_plan(rows, tmp, path, 'a'*20)
+            selected, _, _ = retry_plan_dramas(rows, tmp, path, 'a'*20, quality_policy=QualityPolicy())
             self.assertEqual([j[2]['message_id'] for j in selected], [101])
 
     def test_plan_keeps_archived_videos_whose_cover_is_outstanding(self):
@@ -89,7 +92,7 @@ class SchedulingTests(unittest.TestCase):
             path = Path(tmp) / 'report.json'
             path.write_text(json.dumps({'project_ref': 'a'*20, 'segments': [],
                                         'pending_message_ids': [101, 102, 103]}))
-            selected, _ = retry_plan(jobs(), tmp, path, 'a'*20)
+            selected, _, _ = retry_plan_dramas(jobs(), tmp, path, 'a'*20, quality_policy=QualityPolicy())
             self.assertEqual(len(selected), 3)
 
     def test_db_attempt_backoff_and_active_lease_are_not_forced(self):
@@ -108,7 +111,7 @@ class SchedulingTests(unittest.TestCase):
         self.assertEqual(claim_blocker(cloud), 'attempts_exhausted')
 
     def test_partial_resume_appends_working_copy_preserving_original(self):
-        import archive
+        import video_archive.telegram.archive as archive
         with tempfile.TemporaryDirectory() as tmp:
             store = Store(tmp)
             msg = message(3021)
@@ -129,7 +132,7 @@ class SchedulingTests(unittest.TestCase):
                 offsets.append(kwargs['offset']); return Stream()
             client.iter_download = iterator
             try:
-                with patch('archive.validate_file', return_value={'actual_size': 10, 'sha256': 'test', 'decoded_at': None}):
+                with patch('video_archive.telegram.archive.validate_file', return_value={'actual_size': 10, 'sha256': 'test', 'decoded_at': None}):
                     result = asyncio.run(archive.download_one(client, None, SOURCE, store, record, state,
                                                              resume_partial=True, preserve_partial=True, retries=1))
                 self.assertEqual(result, 'downloaded_success')
@@ -140,7 +143,7 @@ class SchedulingTests(unittest.TestCase):
                 store.db.close()
 
     def test_async_lease_claim_does_not_block_event_loop(self):
-        from pipeline_db import Lease
+        from video_archive.pipeline.db import Lease
         entered = threading.Event()
         def claim(*args):
             time.sleep(0.08); entered.set(); return 'test-token'
@@ -180,13 +183,19 @@ class SchedulingTests(unittest.TestCase):
             mids = [j[2]['message_id'] for j in args[7]]
             retrying = kwargs.get('resume_partials', False)
             calls.append((mids, retrying))
-            return {'videos': [{'message_id': mid, 'result': 'uploaded_readback_verified' if retrying else 'failed'} for mid in mids],
+            return {'videos': [{'message_id': mid,
+                                'result': 'uploaded_readback_verified' if retrying else 'failed',
+                                'cover_result': 'no_thumbnail'} for mid in mids],
                     'download_limit_now': 4, 'stop_reason': None}
         async def no_delay(*args): pass
         async def run():
-            with patch('pipeline_batch.process_batch', segment), patch('pipeline_batch.asyncio.sleep', no_delay):
-                report = await process_pass(*([None]*7), jobs(5), batch_size=2, retry_rounds=1,
-                                            deferred=[{'message_id': 3021}])
+            with tempfile.TemporaryDirectory() as tmp:
+                rows = jobs(5)
+                selected, _, evaluations = plan_dramas(rows, tmp, set(), quality_policy=QualityPolicy())
+                with patch('video_archive.pipeline.batch.process_batch', segment), patch('video_archive.pipeline.batch.asyncio.sleep', no_delay):
+                    report = await process_drama_pass(*([None]*7), selected, drama_evaluations=evaluations,
+                                                      batch_size=2, retry_rounds=1,
+                                                      deferred=[{'message_id': 3021}])
             self.assertEqual(calls, [([101,102],False),([103,104],False),([105],False),
                                      ([101,102],True),([103,104],True),([105],True)])
             self.assertEqual(report['status'], 'normal_queue_archived')
@@ -194,7 +203,7 @@ class SchedulingTests(unittest.TestCase):
         asyncio.run(run())
 
     def test_timeout_keeps_partial_and_next_pass_does_not_delete_or_restart_it(self):
-        import archive
+        import video_archive.telegram.archive as archive
         with tempfile.TemporaryDirectory() as tmp:
             store = Store(tmp)
             msg = message(3021)
@@ -251,7 +260,7 @@ class SchedulingTests(unittest.TestCase):
             self.assertEqual(len(chosen), 1)  # Explicit repeat verification is allowed.
 
     def test_long_flood_stops_already_queued_downloads(self):
-        import archive
+        import video_archive.telegram.archive as archive
         rows = jobs()
         store = SimpleNamespace(videos=lambda: [(x[2], x[3]) for x in rows])
         db = SimpleNamespace(call=lambda *a: None, state=lambda *a: {
@@ -262,7 +271,7 @@ class SchedulingTests(unittest.TestCase):
             await asyncio.sleep(0.03)  # Let other tasks queue behind the gate.
             archive.on_flood(61)
             raise StopArchive('flood_wait: 61s')
-        with patch('pipeline_batch.download_task', download):
+        with patch('video_archive.pipeline.batch.download_task', download):
             report = asyncio.run(process_batch(db, None, None, store, None, None, None, rows, concurrency=1))
         self.assertEqual(len(started), 1)
         self.assertEqual(report['stop_reason'], 'flood_wait')
@@ -294,7 +303,7 @@ class SchedulingTests(unittest.TestCase):
             with self.assertRaises(asyncio.CancelledError):
                 await task
             self.assertTrue(exited.is_set())
-        with patch('pipeline_batch.archive_existing', upload):
+        with patch('video_archive.pipeline.batch.archive_existing', upload):
             asyncio.run(run())
 
     def test_finite_pass_advances_after_failure_but_stops_on_global_stop(self):
@@ -302,18 +311,23 @@ class SchedulingTests(unittest.TestCase):
         async def segment(*args, **kwargs):
             batch = args[7]
             calls.extend(x[2]['message_id'] for x in batch)
-            return {'videos': [{'message_id': x[2]['message_id'], 'result': 'failed'} for x in batch],
+            return {'videos': [{'message_id': x[2]['message_id'], 'result': 'failed',
+                                'cover_result': 'no_thumbnail'} for x in batch],
                     'download_limit_now': 1, 'stop_reason': None}
         async def run():
-            with patch('pipeline_batch.process_batch', segment):
-                report = await process_pass(*([None] * 7), jobs(), batch_size=1)
-            self.assertEqual(report['status'], 'incomplete')
-            self.assertEqual(calls, [101, 102, 103])
-            stopped = AsyncMock(return_value={'videos': [], 'download_limit_now': 1, 'stop_reason': 'flood_wait'})
-            with patch('pipeline_batch.process_batch', stopped):
-                report = await process_pass(*([None] * 7), jobs(), batch_size=1)
-            self.assertEqual(report['status'], 'stopped')
-            self.assertEqual(stopped.await_count, 1)
+            with tempfile.TemporaryDirectory() as tmp:
+                selected, _, evaluations = plan_dramas(jobs(), tmp, set(), quality_policy=QualityPolicy())
+                with patch('video_archive.pipeline.batch.process_batch', segment):
+                    report = await process_drama_pass(*([None] * 7), selected,
+                                                      drama_evaluations=evaluations, batch_size=1)
+                self.assertEqual(report['status'], 'incomplete')
+                self.assertEqual(calls, [101, 102, 103])
+                stopped = AsyncMock(return_value={'videos': [], 'download_limit_now': 1, 'stop_reason': 'flood_wait'})
+                with patch('video_archive.pipeline.batch.process_batch', stopped):
+                    report = await process_drama_pass(*([None] * 7), selected,
+                                                      drama_evaluations=evaluations, batch_size=1)
+                self.assertEqual(report['status'], 'stopped')
+                self.assertEqual(stopped.await_count, 1)
         asyncio.run(run())
 
 

@@ -4,7 +4,7 @@ build_provider() reads .private/ai.json (same permission model as
 .private/pipeline.json, but a separate file since the model key has its own
 lifecycle). call_model() talks to an OpenAI-chat-completions-compatible
 endpoint (base_url + '/chat/completions'); frames go in as base64 JPEG
-image_url parts alongside the system prompt in prompt.md.
+image_url parts alongside the system prompt in prompts/prompt.md.
 """
 import base64
 import contextvars
@@ -17,8 +17,8 @@ import urllib.request
 from datetime import datetime
 from pathlib import Path
 
-from core import media_tools
-from pipeline_common import BASE, PipelineError, ai_config
+from video_archive.core import media_tools
+from video_archive.pipeline.common import BASE, PipelineError, ai_config
 
 # Set by run_ai so a usage line can name the drama without logging the response body.
 usage_subject = contextvars.ContextVar('usage_subject', default=None)
@@ -103,7 +103,7 @@ def transcribe(path, model_name, check=lambda: None):
 
 
 def system_prompt():
-    path = BASE / 'prompt.md'
+    path = BASE / 'prompts/prompt.md'
     text = path.read_text().strip() if path.is_file() else ''
     if not text:
         raise PipelineError('ai_system_prompt_missing')

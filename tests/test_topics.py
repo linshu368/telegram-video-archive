@@ -8,8 +8,8 @@ from unittest.mock import AsyncMock, patch
 
 from telethon import types
 
-import topic_metadata as tm
-from core import StopArchive, now, record_message, topic_membership
+import video_archive.telegram.topics as tm
+from video_archive.core import StopArchive, now, record_message, topic_membership
 from test_archive import DATE, SOURCE, message
 
 FORUM = {**SOURCE, 'forum': True, 'type': 'supergroup'}
@@ -44,7 +44,7 @@ class TopicTests(unittest.IsolatedAsyncioTestCase):
         # IDs are not sorted chronologically; pinned topic is not the cursor.
         client = AsyncMock(side_effect=[page([topic(20, pinned=True), topic(80)]),
                                         page([topic(3)], count=3), page([], count=3)])
-        with patch('topic_metadata.asyncio.sleep', new=AsyncMock()):
+        with patch('video_archive.telegram.topics.asyncio.sleep', new=AsyncMock()):
             result = await tm.collect_directory(client, None, FORUM, self.catalog, 1)
         self.assertTrue(result['reached_empty_page'])
         self.assertFalse(result['count_consistent'])
@@ -75,7 +75,7 @@ class TopicTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_cycle_is_not_completion_and_observations_saved(self):
         client = AsyncMock(return_value=page([topic(8)]))
-        with patch('topic_metadata.asyncio.sleep', new=AsyncMock()):
+        with patch('video_archive.telegram.topics.asyncio.sleep', new=AsyncMock()):
             with self.assertRaisesRegex(StopArchive, 'cycle'):
                 await tm.collect_directory(client, None, FORUM, self.catalog, 1)
         self.assertEqual(client.await_count, 2)
@@ -85,7 +85,7 @@ class TopicTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_order_change_and_budget_stop(self):
         client = AsyncMock(side_effect=[page([topic(8)]), page([topic(7)], creation=True)])
-        with patch('topic_metadata.asyncio.sleep', new=AsyncMock()):
+        with patch('video_archive.telegram.topics.asyncio.sleep', new=AsyncMock()):
             with self.assertRaisesRegex(StopArchive, 'ordering_mode_changed'):
                 await tm.collect_directory(client, None, FORUM, self.catalog, 1)
             client = AsyncMock(return_value=page([topic(6)]))
@@ -94,7 +94,7 @@ class TopicTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_same_page_duplicates_and_empty_page_order_change(self):
         client = AsyncMock(side_effect=[page([topic(8), topic(8)], count=1), page([], count=1)])
-        with patch('topic_metadata.asyncio.sleep', new=AsyncMock()):
+        with patch('video_archive.telegram.topics.asyncio.sleep', new=AsyncMock()):
             result = await tm.collect_directory(client, None, FORUM, self.catalog, 1)
             self.assertEqual(result['duplicate_ids'], [8])
             client = AsyncMock(side_effect=[page([topic(7)]), page([], creation=True)])
@@ -164,7 +164,7 @@ class TopicTests(unittest.IsolatedAsyncioTestCase):
         empty = types.MessageEmpty(9, types.PeerChannel(123))
         client = AsyncMock(side_effect=[page([], messages=[m]), page([], messages=[empty]),
                                         page([], messages=[])])
-        with patch('topic_metadata.asyncio.sleep', new=AsyncMock()):
+        with patch('video_archive.telegram.topics.asyncio.sleep', new=AsyncMock()):
             result = await tm.collect_replies(client, None, FORUM, self.catalog, 7, DATE + timedelta(days=1))
         self.assertEqual(result['message_ids'], [9, 10])
         self.assertTrue(result['reached_empty_page'])
@@ -175,7 +175,7 @@ class TopicTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_replies_duplicate_page_stops(self):
         client = AsyncMock(return_value=page([], messages=[message(10)]))
-        with patch('topic_metadata.asyncio.sleep', new=AsyncMock()):
+        with patch('video_archive.telegram.topics.asyncio.sleep', new=AsyncMock()):
             with self.assertRaisesRegex(StopArchive, 'pagination_boundary'):
                 await tm.collect_replies(client, None, FORUM, self.catalog, 7, DATE + timedelta(days=1))
 
@@ -201,7 +201,7 @@ class TopicTests(unittest.IsolatedAsyncioTestCase):
     async def test_unauthorized_does_not_resolve_or_download(self):
         client = AsyncMock()
         client.is_user_authorized.return_value = False
-        with patch('topic_metadata.confirmed_target', new=AsyncMock()) as resolve:
+        with patch('video_archive.telegram.topics.confirmed_target', new=AsyncMock()) as resolve:
             with self.assertRaisesRegex(StopArchive, 'authorized_user'):
                 await tm.collect(client, self.catalog, {}, 100)
         resolve.assert_not_awaited()
@@ -227,10 +227,10 @@ class TopicTests(unittest.IsolatedAsyncioTestCase):
         client.is_bot.return_value = False
         client.get_messages.return_value = m
         report = {'started_at': now(), 'limits': []}
-        with patch('topic_metadata.PROBE', probe), \
-                patch('topic_metadata.confirmed_target', new=AsyncMock(return_value=(None, source))), \
-                patch('topic_metadata.asyncio.sleep', new=AsyncMock()), \
-                patch('topic_metadata.validate_file', return_value={'verified_at': now(), 'decoded_at': None}):
+        with patch('video_archive.telegram.topics.PROBE', probe), \
+                patch('video_archive.telegram.topics.confirmed_target', new=AsyncMock(return_value=(None, source))), \
+                patch('video_archive.telegram.topics.asyncio.sleep', new=AsyncMock()), \
+                patch('video_archive.telegram.topics.validate_file', return_value={'verified_at': now(), 'decoded_at': None}):
             await tm.collect(client, self.catalog, report, 100)
         self.assertEqual(report['result'], 'TOPIC_METADATA_VERIFIED')
         self.assertTrue(report['source']['protected'])

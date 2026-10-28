@@ -8,7 +8,7 @@ from collections import Counter
 from datetime import datetime, timezone
 from pathlib import Path
 
-BASE = Path(__file__).resolve().parent
+from video_archive.paths import BASE
 NAMESPACE = uuid.UUID('795ec7d2-3505-4cef-9f46-8aad88c7028b')
 
 
@@ -194,10 +194,15 @@ def covers_committed(root, project_ref):
     return done
 
 
-def snapshot(root, topics_path):
-    """Read one consistent SQLite snapshot. Never open legacy Store to import."""
+def snapshot(root, topics_path, *, require_complete=False):
+    """Read one consistent SQLite snapshot. Never open legacy Store to import.
+
+    Drama selection needs the whole frozen inventory, not the first observed
+    episodes of a topic. Legacy inspection/sample commands can still read an
+    unfinished inventory explicitly through the default.
+    """
     root = Path(root).resolve()
-    topics = json.loads(Path(topics_path).read_text())
+    topics = [] if require_complete else json.loads(Path(topics_path).read_text())
     names = {}
     for t in topics:
         if t.get('deleted') or not text(t.get('topic_title')):
@@ -210,9 +215,68 @@ def snapshot(root, topics_path):
     result, excluded = [], Counter()
     try:
         db.execute('BEGIN')
+        source_members = None
+        if require_complete:
+            task = {key: json.loads(value) for key, value in db.execute('SELECT key,value FROM task')}
+            if task.get('scan_complete') is not True:
+                raise PipelineError('inventory_scan_incomplete')
+            if task.get('source_topic_inventory_complete') is not True:
+                raise PipelineError('source_topic_inventory_required')
+            source_id = (task.get('source') or {}).get('id')
+            boundary = {'source_id': source_id, 'upper_id': task.get('upper_id'),
+                        'cutoff_exclusive_utc': task.get('cutoff_exclusive_utc')}
+            if (type(source_id) is not int or source_id == 0
+                    or type(boundary['upper_id']) is not int or boundary['upper_id'] < 0
+                    or not isinstance(boundary['cutoff_exclusive_utc'], str)
+                    or not boundary['cutoff_exclusive_utc']
+                    or task.get('source_topic_inventory_boundary') != boundary):
+                raise PipelineError('source_topic_inventory_boundary_conflict')
+            topic_ids = task.get('source_topic_ids')
+            if (not isinstance(topic_ids, list)
+                    or any(type(tid) is not int or tid <= 1 for tid in topic_ids)
+                    or len(set(topic_ids)) != len(topic_ids)):
+                raise PipelineError('source_topic_inventory_incomplete')
+            try:
+                proofs = {tid: json.loads(data) for sid, tid, data in db.execute(
+                    'SELECT source_id,topic_id,data FROM topic_inventories')
+                          if sid == source_id and tid in topic_ids}
+            except sqlite3.OperationalError:
+                raise PipelineError('source_topic_inventory_required') from None
+            if set(proofs) != set(topic_ids):
+                raise PipelineError('source_topic_inventory_incomplete')
+            source_members = {}
+            for tid, proof in proofs.items():
+                if (proof.get('complete') is not True or proof.get('reached_empty_page') is not True
+                        or any(proof.get(k) != value for k, value in boundary.items())
+                        or proof.get('topic_id') != tid or not text(proof.get('topic_title'))
+                        or not isinstance(proof.get('video_metadata'), list)):
+                    raise PipelineError('source_topic_inventory_incomplete')
+                names[source_id, tid] = text(proof['topic_title'])
+                for member in proof['video_metadata']:
+                    if not isinstance(member, dict):
+                        raise PipelineError('source_topic_inventory_identity_conflict')
+                    mid = member.get('message_id')
+                    if (type(mid) is not int or mid <= 0 or mid > boundary['upper_id']
+                            or not member.get('media_id') or mid in source_members):
+                        raise PipelineError('source_topic_inventory_identity_conflict')
+                    source_members[mid] = (tid, member)
+        from video_archive.screening.quality import media_metadata
+        seen_members = set()
         for raw, state in db.execute('SELECT m.data,v.data FROM messages m JOIN videos v ON m.id=v.message_id ORDER BY m.id'):
             r, s = json.loads(raw), json.loads(state)
             sid, mid, tid = int(r['source']['id']), int(r['message_id']), r.get('topic_id')
+            if source_members is not None:
+                if mid not in source_members:
+                    excluded['outside_source_topic_inventory'] += 1
+                    continue
+                source_tid, member = source_members[mid]
+                if (sid != source_id or tid != source_tid
+                        or r.get('media_id') != member['media_id']):
+                    raise PipelineError('source_topic_inventory_identity_conflict')
+                r = {**r, **{key: member.get(key) for key in (
+                    'expected_size', 'duration_seconds', 'width', 'height', 'bitrate_bps')},
+                     'metadata_origin': 'complete_source_topic_inventory'}
+                seen_members.add(mid)
             if tid == 1:
                 excluded['general'] += 1
                 continue
@@ -227,8 +291,10 @@ def snapshot(root, topics_path):
             v = {'id': vid, 'drama_id': did, 'source_id': str(sid), 'message_id': str(mid),
                  'media_id': str(r['media_id']), 'original_title': text(r.get('title')),
                  'original_tags': tags(r.get('tags')), 'original_description': text(r.get('description')),
-                 'episode': text(r.get('episode'))}
+                 'episode': text(r.get('episode')), **media_metadata(r, s)}
             result.append((d, v, r, s))
+        if source_members is not None and seen_members != set(source_members):
+            raise PipelineError('source_topic_inventory_records_missing')
     finally:
         db.close()
     return result, dict(excluded)

@@ -290,6 +290,9 @@ class Store:
                 number INTEGER PRIMARY KEY, request_offset INTEGER, next_offset INTEGER,
                 ids TEXT, collected_at TEXT);
             CREATE TABLE IF NOT EXISTS topics (id INTEGER PRIMARY KEY, data TEXT NOT NULL);
+            CREATE TABLE IF NOT EXISTS topic_inventories (
+                source_id INTEGER, topic_id INTEGER, data TEXT NOT NULL,
+                PRIMARY KEY(source_id,topic_id));
             CREATE TABLE IF NOT EXISTS covers (
                 message_id INTEGER PRIMARY KEY REFERENCES messages(id),
                 status TEXT NOT NULL, data TEXT NOT NULL);
@@ -320,35 +323,59 @@ class Store:
             for topic in topics:
                 self.db.execute('INSERT OR REPLACE INTO topics VALUES (?,?)',
                                 (topic.id, json.dumps(clean(topic), ensure_ascii=False)))
-            for r in records:
-                self.db.execute('INSERT OR IGNORE INTO messages VALUES (?,?)',
-                                (r['message_id'], json.dumps(r, ensure_ascii=False)))
-                if r['video_evidence']:
-                    status = 'skipped' if is_general(r) else 'pending'
-                    state = {'status': status, 'attempts': 0, 'local_path': '', 'actual_size': None,
-                             'sha256': '', 'downloaded_at': None, 'verified_at': None,
-                             'failure_reason': 'general_topic_excluded' if is_general(r) else '',
-                             'events': []}
-                    self.db.execute('INSERT OR IGNORE INTO videos VALUES (?,?,?)',
-                                    (r['message_id'], status, json.dumps(state)))
-                    # The cover tracks its own status: neither side blocks the other.
-                    cover = {**COVER_STATE, 'status': status, 'events': [],
-                             'failure_reason': 'general_topic_excluded' if is_general(r) else ''}
-                    self.db.execute('INSERT OR IGNORE INTO covers VALUES (?,?,?)',
-                                    (r['message_id'], status, json.dumps(cover)))
-                raw = r['raw_message']
-                action = (raw.get('action') or {}).get('_', '')
-                media = (raw.get('media') or {}).get('_', '')
-                if 'Migrate' in action or 'PaidMedia' in media:
-                    limitations = self.get('limitations', [])
-                    note = f'message {r["message_id"]}: {action or media}; not followed or purchased'
-                    if note not in limitations:
-                        self.set('limitations', limitations + [note])
+            self._ingest_records(records)
             self.db.execute('INSERT INTO pages(request_offset,next_offset,ids,collected_at) VALUES (?,?,?,?)',
                             (requested_offset, next_offset, json.dumps(ids), now()))
             self.set('cursor', next_offset)
             if not ids:
                 self.set('scan_complete', True)
+
+    def _ingest_records(self, records):
+        for r in records:
+            self.db.execute('INSERT OR IGNORE INTO messages VALUES (?,?)',
+                            (r['message_id'], json.dumps(r, ensure_ascii=False)))
+            if r['video_evidence']:
+                status = 'skipped' if is_general(r) else 'pending'
+                state = {'status': status, 'attempts': 0, 'local_path': '', 'actual_size': None,
+                         'sha256': '', 'downloaded_at': None, 'verified_at': None,
+                         'failure_reason': 'general_topic_excluded' if is_general(r) else '',
+                         'events': []}
+                self.db.execute('INSERT OR IGNORE INTO videos VALUES (?,?,?)',
+                                (r['message_id'], status, json.dumps(state)))
+                cover = {**COVER_STATE, 'status': status, 'events': [],
+                         'failure_reason': 'general_topic_excluded' if is_general(r) else ''}
+                self.db.execute('INSERT OR IGNORE INTO covers VALUES (?,?,?)',
+                                (r['message_id'], status, json.dumps(cover)))
+            raw = r['raw_message']
+            action = (raw.get('action') or {}).get('_', '')
+            media = (raw.get('media') or {}).get('_', '')
+            if 'Migrate' in action or 'PaidMedia' in media:
+                limitations = self.get('limitations', [])
+                note = f'message {r["message_id"]}: {action or media}; not followed or purchased'
+                if note not in limitations:
+                    self.set('limitations', limitations + [note])
+
+    def ingest_topic_records(self, records):
+        """Add source-topic metadata without advancing global history evidence."""
+        with self.db:
+            for record in records:
+                old = self.db.execute('SELECT data FROM messages WHERE id=?',
+                                      (record['message_id'],)).fetchone()
+                if old:
+                    previous = json.loads(old[0])
+                    if (previous['source']['id'] != record['source']['id']
+                            or previous.get('media_id') != record.get('media_id')
+                            or (previous.get('expected_size') is not None
+                                and record.get('expected_size') is not None
+                                and previous['expected_size'] != record['expected_size'])):
+                        raise StopArchive('source_video_identity_changed')
+            self._ingest_records(records)
+
+    def save_topic_inventory(self, proof):
+        with self.db:
+            self.db.execute('INSERT OR REPLACE INTO topic_inventories VALUES (?,?,?)',
+                            (proof['source_id'], proof['topic_id'],
+                             json.dumps(proof, ensure_ascii=False)))
 
     def videos(self):
         return [(json.loads(row['message']), json.loads(row['data'])) for row in self.db.execute(

@@ -17,15 +17,15 @@ from unittest.mock import Mock, patch
 from urllib.error import HTTPError, URLError
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-import archive
-from core import Store, filename, record_message
-from pipeline import archive_existing, download_task, main, run_ai, sample_evidence
-from pipeline_cache import Cache, archived_local
-from pipeline_common import (BASE, PipelineError, ai_output, config, cover_object_path,
+import video_archive.telegram.archive as archive
+from video_archive.core import Store, filename, record_message
+from video_archive.pipeline.runner import archive_existing, download_task, main, run_ai, sample_evidence
+from video_archive.pipeline.cache import Cache, archived_local
+from video_archive.pipeline.common import (BASE, PipelineError, ai_output, config, cover_object_path,
                              covers_committed, display, error_code, identity, object_path,
                              snapshot)
-from pipeline_db import Database, Lease
-from pipeline_storage import CHUNK, COVER_LIMIT, COVERS, Storage
+from video_archive.pipeline.db import Database, Lease
+from video_archive.pipeline.storage import CHUNK, COVER_LIMIT, COVERS, Storage
 from test_archive import FakeClient, SOURCE, message
 
 PROJECT = 'a' * 20
@@ -45,11 +45,11 @@ class CommonTests(unittest.TestCase):
                 for mid in (6558, 6559) for d, v in [fixture(mid)]]
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
-            with patch('pipeline.BASE', root), patch('pipeline.snapshot', return_value=(rows, {})), \
-                    patch('pipeline.config', return_value={'database_dsn': 'test', 'global_file_limit': 100,
+            with patch('video_archive.pipeline.runner.BASE', root), patch('video_archive.pipeline.runner.snapshot', return_value=(rows, {})), \
+                    patch('video_archive.pipeline.runner.config', return_value={'database_dsn': 'test', 'global_file_limit': 100,
                                                           'bucket_file_limit': 100, 'project_ref': 'a'*20}), \
-                    patch('pipeline.Database') as database, patch('pipeline.Storage') as storage, \
-                    patch('pipeline.import_rows') as importer, \
+                    patch('video_archive.pipeline.runner.Database') as database, patch('video_archive.pipeline.runner.Storage') as storage, \
+                    patch('video_archive.pipeline.runner.import_rows') as importer, \
                     patch.object(sys, 'argv', ['pipeline.py', '--data', str(root), 'samples']):
                 database.return_value.verify_worker.side_effect = PipelineError('restricted_worker_login_required')
                 self.assertEqual(main(), 2)
@@ -62,10 +62,10 @@ class CommonTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             (root / 'migrations').mkdir()
-            with patch('pipeline.BASE', root), patch('pipeline.snapshot', return_value=(rows, {})), \
-                    patch('pipeline.config', return_value={'database_dsn': 'test', 'global_file_limit': 100,
+            with patch('video_archive.pipeline.runner.BASE', root), patch('video_archive.pipeline.runner.snapshot', return_value=(rows, {})), \
+                    patch('video_archive.pipeline.runner.config', return_value={'database_dsn': 'test', 'global_file_limit': 100,
                                                           'bucket_file_limit': 100, 'project_ref': 'a'*20}), \
-                    patch('pipeline.Database'), patch('pipeline.Storage'), \
+                    patch('video_archive.pipeline.runner.Database'), patch('video_archive.pipeline.runner.Storage'), \
                     patch('psycopg.connect') as connect:
                 for name in ('../004_cover.sql', '004_cover.sql; DROP SCHEMA x',
                              '001_pipeline.sql', '004_cover.sql'):
@@ -81,14 +81,14 @@ class CommonTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             original = root / 'sample'; original.write_bytes(b'original')
-            with patch('pipeline.BASE', root), patch('pipeline.snapshot', return_value=(rows, {})), \
-                    patch('pipeline.config', return_value={'database_dsn': 'test', 'global_file_limit': 100,
+            with patch('video_archive.pipeline.runner.BASE', root), patch('video_archive.pipeline.runner.snapshot', return_value=(rows, {})), \
+                    patch('video_archive.pipeline.runner.config', return_value={'database_dsn': 'test', 'global_file_limit': 100,
                                                           'bucket_file_limit': 100, 'project_ref': 'a'*20}), \
-                    patch('pipeline.Database') as database, patch('pipeline.Storage'), \
-                    patch('pipeline.import_rows'), patch('pipeline.backup_legacy'), \
-                    patch('pipeline.archive_existing', side_effect=['uploaded_readback_verified', OSError('private detail')]), \
-                    patch('pipeline.sample_evidence', return_value={'message_id': 6558, 'remote_sha256': 'test-only'}), \
-                    patch('pipeline.local_file', return_value=original), \
+                    patch('video_archive.pipeline.runner.Database') as database, patch('video_archive.pipeline.runner.Storage'), \
+                    patch('video_archive.pipeline.runner.import_rows'), patch('video_archive.pipeline.runner.backup_legacy'), \
+                    patch('video_archive.pipeline.runner.archive_existing', side_effect=['uploaded_readback_verified', OSError('private detail')]), \
+                    patch('video_archive.pipeline.runner.sample_evidence', return_value={'message_id': 6558, 'remote_sha256': 'test-only'}), \
+                    patch('video_archive.pipeline.runner.local_file', return_value=original), \
                     patch.object(sys, 'argv', ['pipeline.py', '--data', str(root), 'samples']):
                 database.return_value.verify_worker.return_value = {'test_double': True}
                 self.assertEqual(main(), 2)
@@ -180,7 +180,7 @@ class CommonTests(unittest.TestCase):
                 config(p)
 
     def test_select_ai_candidates_order_and_limit(self):
-        from pipeline_batch import select_ai_candidates
+        from video_archive.pipeline.batch import select_ai_candidates
         rows = [(None, None, {'message_id': i}, None) for i in (5, 3, 9, 7, 2)]
         self.assertEqual([r[2]['message_id'] for r in select_ai_candidates(rows, {3, 7, 9})], [3, 7, 9])
         self.assertEqual([r[2]['message_id'] for r in select_ai_candidates(rows, {3, 7, 9}, limit=2)], [3, 7])
@@ -191,25 +191,25 @@ class CommonTests(unittest.TestCase):
                 select_ai_candidates(rows, {3}, limit=bad)
 
     def test_system_prompt_missing_and_present(self):
-        from pipeline_ai import system_prompt
-        with patch('pipeline_ai.BASE', Path('/nonexistent-dir-for-test-only')):
+        from video_archive.pipeline.ai import system_prompt
+        with patch('video_archive.pipeline.ai.BASE', Path('/nonexistent-dir-for-test-only')):
             with self.assertRaisesRegex(PipelineError, 'ai_system_prompt_missing'):
                 system_prompt()
         self.assertIn('18', system_prompt())  # real prompt.md ships with the repo
 
     def test_strip_fence(self):
-        from pipeline_ai import strip_fence
+        from video_archive.pipeline.ai import strip_fence
         self.assertEqual(strip_fence('```json\n{"a":1}\n```'), '{"a":1}')
         self.assertEqual(strip_fence('  {"a":1}  '), '{"a":1}')
 
     def test_call_model_sends_frames_with_auth_and_parses_fenced_json(self):
-        from pipeline_ai import call_model
+        from video_archive.pipeline.ai import call_model
         cfg = {'model': 'm', 'api_key': 'k', 'base_url': 'https://api.example.com/v1', 'request_timeout': 5}
         response = Mock()
         response.read.return_value = json.dumps({'choices': [{'message': {
             'content': '```json\n{"title": "t", "tags": ["a"], "description": null}\n```'}}]}).encode()
         response.__enter__, response.__exit__ = Mock(return_value=response), Mock(return_value=False)
-        with patch('pipeline_ai.urllib.request.urlopen', return_value=response) as urlopen:
+        with patch('video_archive.pipeline.ai.urllib.request.urlopen', return_value=response) as urlopen:
             result = call_model([b'frame-bytes'], '', cfg, lambda: None)
         self.assertEqual(result, {'title': 't', 'tags': ['a'], 'description': None})
         request = urlopen.call_args[0][0]
@@ -223,7 +223,7 @@ class CommonTests(unittest.TestCase):
         # No transcript: no extra text part beyond the leading instruction.
         text_parts = [p for p in body['messages'][1]['content'] if p['type'] == 'text']
         self.assertEqual(len(text_parts), 1)
-        with patch('pipeline_ai.urllib.request.urlopen', return_value=response) as urlopen:
+        with patch('video_archive.pipeline.ai.urllib.request.urlopen', return_value=response) as urlopen:
             call_model([b'frame-bytes'], '字幕转写文字', cfg, lambda: None)
         body = json.loads(urlopen.call_args[0][0].data)
         text_parts = [p for p in body['messages'][1]['content'] if p['type'] == 'text']
@@ -231,7 +231,7 @@ class CommonTests(unittest.TestCase):
         self.assertIn('字幕转写文字', text_parts[1]['text'])
 
     def test_ai_config_permissions_and_fields(self):
-        from pipeline_common import ai_config
+        from video_archive.pipeline.common import ai_config
         with tempfile.TemporaryDirectory() as tmp:
             p = Path(tmp) / 'ai.json'
             with self.assertRaisesRegex(PipelineError, 'missing'):
@@ -508,13 +508,13 @@ class StorageTests(unittest.TestCase):
         response = Response(b'[]')
         storage.opener = Mock()
         storage.opener.open.side_effect = [URLError('fixture'), response]
-        with patch('pipeline_storage.time.sleep'):
+        with patch('video_archive.pipeline.storage.time.sleep'):
             self.assertIs(storage.request('GET', storage.base+'/bucket'), response)
         self.assertEqual(storage.opener.open.call_count, 2)
         for method in ('POST','PATCH','GET'):
             storage.opener.open.reset_mock()
             storage.opener.open.side_effect = URLError('fixture')
-            with patch('pipeline_storage.time.sleep'), self.assertRaises(URLError):
+            with patch('video_archive.pipeline.storage.time.sleep'), self.assertRaises(URLError):
                 storage.request(method, storage.base+'/upload/resumable')
             self.assertEqual(storage.opener.open.call_count, 3 if method=='GET' else 1)
 
@@ -931,13 +931,13 @@ class PostgresTests(unittest.TestCase):
                 if name == 'finish' and args[1] == 'upload':
                     raise OSError('commit unavailable')
                 return original(name, *args)
-            with patch('pipeline.validate_file', return_value=validated), patch.object(self.db, 'call', side_effect=fail_commit):
+            with patch('video_archive.pipeline.runner.validate_file', return_value=validated), patch.object(self.db, 'call', side_effect=fail_commit):
                 with self.assertRaises(OSError):
                     archive_existing(self.db, storage, cache, v, r, s)
             self.assertTrue(p.exists())
             self.assertIsNotNone(storage.content)
             self.owner.execute("UPDATE drama_archive.pipeline_tasks SET updated_at=clock_timestamp()-interval '1 hour' WHERE video_id=%s", (v['id'],))
-            with patch('pipeline.validate_file', return_value=validated):
+            with patch('video_archive.pipeline.runner.validate_file', return_value=validated):
                 archive_existing(Database(self.db.dsn), storage, Cache(root), v, r, s)
             self.assertEqual(storage.posts, 1)
             self.assertTrue(cache.get(v['id'])['archived'])
@@ -972,9 +972,9 @@ class PostgresTests(unittest.TestCase):
 
     def test_ai_candidates_and_run_ai_extract_frames_and_commit(self):
         import subprocess
-        from core import sha256
-        from pipeline_ai import Provider
-        from pipeline_batch import select_ai_candidates
+        from video_archive.core import sha256
+        from video_archive.pipeline.ai import Provider
+        from video_archive.pipeline.batch import select_ai_candidates
         self.uploaded()
         with tempfile.TemporaryDirectory() as tmp:
             video_path = Path(tmp) / 'sample.mp4'
@@ -987,7 +987,7 @@ class PostgresTests(unittest.TestCase):
             candidates = select_ai_candidates(rows, self.db.archived_messages())
             self.assertEqual([v['id'] for _, v, _, _ in candidates], [self.vid])
             provider = Provider({'frame_count': 2, 'max_dim': 64})
-            with patch('pipeline_ai.call_model', return_value={
+            with patch('video_archive.pipeline.ai.call_model', return_value={
                     'title': 'drama title', 'tags': ['a'], 'description': None}) as called:
                 run_ai(self.db, None, cache, self.d['id'], provider)
             self.assertEqual(len(called.call_args[0][0]), 2)
@@ -1049,23 +1049,34 @@ class PostgresTests(unittest.TestCase):
                     (role,)).fetchone()[0])
         self.assertTrue(self.worker.verify_worker()['restricted_login'])
 
-    def test_batch_select_order_and_limits(self):
-        from pipeline_batch import select
-        rows = [(None, None, {'message_id': i}, {'status': st}) for i, st in
-                [(5, 'pending'), (3, 'success'), (9, 'pending'), (7, 'failed'), (8, 'blocked'), (2, 'pending')]]
-        self.assertEqual([r[2]['message_id'] for r in select(rows, 3, [9])], [9, 2, 3])
-        for bad in (0, 101, True):
-            with self.assertRaises(PipelineError):
-                select(rows, bad)
-        with self.assertRaisesRegex(PipelineError, 'first_id_not_pending'):
-            select(rows, 2, [8])
-        # Local success whose upload never committed is picked up; archived ones are not.
-        self.assertEqual([r[2]['message_id'] for r in select(rows, 4, [3])], [3, 2, 5, 7])
-        self.assertEqual([r[2]['message_id'] for r in select(rows, 4, [], {2, 5})], [3, 7, 9])
+    def test_drama_plan_order_and_cloud_completion(self):
+        from video_archive.pipeline.batch import plan_dramas
+        from video_archive.screening.quality import QualityPolicy
+        rows = []
+        for mid, status in [(5, 'pending'), (3, 'success'), (9, 'pending'),
+                            (7, 'failed'), (8, 'blocked'), (2, 'pending')]:
+            d, v = fixture(mid, topic=mid)
+            rows.append((d, v, {'message_id': mid, 'expected_size': 10, 'width': 720,
+                                'height': 1280, 'bitrate_bps': 2_000_000,
+                                'source': {'id': -100123}, 'media_id': 9000 + mid,
+                                'original_filename': 'fixture.mp4'}, {'status': status}))
+        with tempfile.TemporaryDirectory() as tmp:
+            def choose(limit, first=(), archived=frozenset()):
+                return plan_dramas(rows, tmp, archived, quality_policy=QualityPolicy(),
+                                   first=first, covered=archived, video_limit=limit)
+            self.assertEqual([j[2]['message_id'] for j in choose(3, [9])[0]], [9, 2, 3])
+            for bad in (0, True):
+                with self.assertRaises(PipelineError):
+                    choose(bad)
+            _, deferred, _ = choose(2, [8])
+            self.assertEqual(deferred[0]['message_id'], 8)
+            self.assertEqual(deferred[0]['reason'], 'drama_member_deferred')
+            self.assertEqual([j[2]['message_id'] for j in choose(4, [3])[0]], [3, 2, 5, 7])
+            self.assertEqual([j[2]['message_id'] for j in choose(4, archived={2, 5})[0]], [3, 7, 9])
 
     def test_batch_concurrent_download_upload_flood_and_cleanup(self):
         import subprocess
-        from pipeline_batch import process_batch, select
+        from video_archive.pipeline.batch import process_batch
         class MemStorage:
             # Keyed by bucket and object path: the cover must not see the video's object.
             objects, posts, cover_posts = {}, 0, 0

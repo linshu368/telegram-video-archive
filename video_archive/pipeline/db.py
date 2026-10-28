@@ -6,7 +6,7 @@ import time
 import psycopg
 from psycopg.types.json import Jsonb
 
-from pipeline_common import PipelineError, error_code
+from video_archive.pipeline.common import PipelineError, error_code
 
 
 class Database:

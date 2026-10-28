@@ -4,8 +4,8 @@ from unittest.mock import AsyncMock, patch
 
 import test_archive as fixtures
 from test_archive import FakeClient, SOURCE, message
-import probe_download
-from core import StopArchive, now
+import scripts.diagnostics.probe_download as probe_download
+from video_archive.core import StopArchive, now
 
 
 class ProbeTests(unittest.IsolatedAsyncioTestCase):
@@ -20,8 +20,8 @@ class ProbeTests(unittest.IsolatedAsyncioTestCase):
         client.is_bot = AsyncMock(return_value=False)
         protected = {**SOURCE, 'protected': True}
         report = {'started_at': now(), 'pages_checked': 0, 'messages_checked': 0}
-        with patch('probe_download.confirmed_target', new=AsyncMock(return_value=(None, protected))), \
-                patch('probe_download.history_page', new=AsyncMock(return_value=(client.messages, []))):
+        with patch('scripts.diagnostics.probe_download.confirmed_target', new=AsyncMock(return_value=(None, protected))), \
+                patch('scripts.diagnostics.probe_download.history_page', new=AsyncMock(return_value=(client.messages, []))):
             await probe_download.probe(client, self.store.root, report)
         self.assertEqual(client.downloads, 1)
         self.assertEqual(report['result'], 'SINGLE_VIDEO_VERIFIED')
@@ -35,8 +35,8 @@ class ProbeTests(unittest.IsolatedAsyncioTestCase):
         client.is_bot = AsyncMock(return_value=False)
         client.download_media = AsyncMock(side_effect=fixtures.errors.ChatForwardsRestrictedError(request=None))
         report = {'started_at': now(), 'pages_checked': 0, 'messages_checked': 0}
-        with patch('probe_download.confirmed_target', new=AsyncMock(return_value=(None, SOURCE))), \
-                patch('probe_download.history_page', new=AsyncMock(return_value=(client.messages, []))):
+        with patch('scripts.diagnostics.probe_download.confirmed_target', new=AsyncMock(return_value=(None, SOURCE))), \
+                patch('scripts.diagnostics.probe_download.history_page', new=AsyncMock(return_value=(client.messages, []))):
             with self.assertRaises(fixtures.errors.ChatForwardsRestrictedError):
                 await probe_download.probe(client, self.store.root, report)
         self.assertEqual(client.download_media.await_count, 1)
@@ -51,8 +51,8 @@ class ProbeTests(unittest.IsolatedAsyncioTestCase):
         client.is_bot = AsyncMock(return_value=False)
         report = {'started_at': now(), 'pages_checked': 0, 'messages_checked': 0}
         pages = AsyncMock(side_effect=[([msg], []), ([], [])])
-        with patch('probe_download.confirmed_target', new=AsyncMock(return_value=(None, SOURCE))), \
-                patch('probe_download.history_page', new=pages):
+        with patch('scripts.diagnostics.probe_download.confirmed_target', new=AsyncMock(return_value=(None, SOURCE))), \
+                patch('scripts.diagnostics.probe_download.history_page', new=pages):
             with self.assertRaises(StopArchive):
                 await probe_download.probe(client, self.store.root, report)
         self.assertEqual(client.downloads, 0)
@@ -62,8 +62,8 @@ class ProbeTests(unittest.IsolatedAsyncioTestCase):
         client.is_user_authorized = AsyncMock(return_value=True)
         client.is_bot = AsyncMock(return_value=False)
         report = {'started_at': now(), 'pages_checked': 0, 'messages_checked': 0}
-        with patch('probe_download.confirmed_target', new=AsyncMock(return_value=(None, SOURCE))), \
-                patch('probe_download.history_page', new=AsyncMock(return_value=(client.messages, []))):
+        with patch('scripts.diagnostics.probe_download.confirmed_target', new=AsyncMock(return_value=(None, SOURCE))), \
+                patch('scripts.diagnostics.probe_download.history_page', new=AsyncMock(return_value=(client.messages, []))):
             with self.assertRaisesRegex(StopArchive, 'pagination_boundary_error'):
                 await probe_download.probe(client, self.store.root, report)
         self.assertEqual(client.downloads, 0)
@@ -71,7 +71,7 @@ class ProbeTests(unittest.IsolatedAsyncioTestCase):
     async def test_unauthorized_session_never_resolves_source(self):
         client = FakeClient([])
         client.is_user_authorized = AsyncMock(return_value=False)
-        with patch('probe_download.confirmed_target', new=AsyncMock()) as resolve:
+        with patch('scripts.diagnostics.probe_download.confirmed_target', new=AsyncMock()) as resolve:
             with self.assertRaisesRegex(StopArchive, 'authorized_user_session_required'):
                 await probe_download.probe(client, self.store.root, {})
         resolve.assert_not_awaited()

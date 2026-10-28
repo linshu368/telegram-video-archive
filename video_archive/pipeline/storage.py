@@ -7,7 +7,7 @@ from urllib.error import HTTPError, URLError
 from urllib.parse import urljoin, urlsplit
 from urllib.request import HTTPRedirectHandler, Request, build_opener
 
-from pipeline_common import PipelineError, cover_object_path, object_path
+from video_archive.pipeline.common import PipelineError, cover_object_path, object_path
 
 CHUNK = 6 * 1024 * 1024
 VIDEOS = 'drama-videos'

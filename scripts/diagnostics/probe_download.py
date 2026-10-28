@@ -1,13 +1,18 @@
 """Explicit opt-in, one-video standard API test; NOT a history backfill."""
 import argparse
+import sys
+from pathlib import Path
 import asyncio
 import fcntl
 import os
 from datetime import datetime
 
-from archive import (BASE, PRIVATE, client_for, confirmed_target, history_page,
+if __package__ in (None, ''):
+    sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+
+from video_archive.telegram.archive import (BASE, PRIVATE, client_for, confirmed_target, history_page,
                      load_config, private_init, rpc, safe_error)
-from core import (StopArchive, atomic_json, classify, disk_check, filename,
+from video_archive.core import (StopArchive, atomic_json, classify, disk_check, filename,
                   media_tools, now, record_message, validate_file)
 
 

@@ -6,20 +6,24 @@ Read-only: does not touch Lease/claim/finish, so it never changes the task's
 status or attempts count in the database.
 
 Usage:
-    .venv/bin/python debug_ai_raw.py <video_id>
+    .venv/bin/python scripts/diagnostics/debug_ai_raw.py <video_id>
 """
 import argparse
 import base64
 import json
 import sys
+from pathlib import Path
 import urllib.request
 
-from pipeline import ai_input
-from pipeline_ai import extract_frames, system_prompt, strip_fence
-from pipeline_cache import Cache
-from pipeline_common import BASE, ai_config, config
-from pipeline_db import Database
-from pipeline_storage import Storage
+if __package__ in (None, ''):
+    sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+
+from video_archive.pipeline.runner import ai_input
+from video_archive.pipeline.ai import extract_frames, system_prompt, strip_fence
+from video_archive.pipeline.cache import Cache
+from video_archive.pipeline.common import BASE, ai_config, config
+from video_archive.pipeline.db import Database
+from video_archive.pipeline.storage import Storage
 
 
 def raw_call(frames, cfg):

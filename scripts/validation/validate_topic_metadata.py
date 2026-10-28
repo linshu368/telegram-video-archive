@@ -8,8 +8,11 @@ import sys
 from collections import Counter
 from pathlib import Path
 
-from core import SECRET_KEYS, atomic_json, now, sha256
-from topic_metadata import BASE, Catalog, original_state
+if __package__ in (None, ''):
+    sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+
+from video_archive.core import SECRET_KEYS, atomic_json, now, sha256
+from video_archive.telegram.topics import BASE, Catalog, original_state
 
 
 def no_secrets(value):

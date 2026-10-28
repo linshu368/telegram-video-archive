@@ -5,11 +5,15 @@ import subprocess
 import sys
 from pathlib import Path
 
-from core import atomic_json, now
+if __package__ in (None, ''):
+    sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+
+from video_archive.paths import BASE
+from video_archive.core import atomic_json, now
 
 
 def main():
-    root = Path(__file__).resolve().parent
+    root = BASE
     output = root / 'archive'
     output.mkdir(exist_ok=True)
     proc = subprocess.run([sys.executable, '-m', 'unittest', 'discover',

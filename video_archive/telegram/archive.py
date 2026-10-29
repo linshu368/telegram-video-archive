@@ -89,11 +89,23 @@ def load_config(interactive=False):
     return config
 
 
-def client_for(config):
-    return TelegramClient(str(PRIVATE / 'user'), config['api_id'], config['api_hash'],
+def session_paths(name='default'):
+    """The legacy session keeps its paths; named sessions own separate locks."""
+    if not re.fullmatch(r'[A-Za-z0-9][A-Za-z0-9_-]{0,63}', name):
+        raise StopArchive('invalid_session_name')
+    folder = PRIVATE if name == 'default' else PRIVATE / 'sessions' / name
+    folder.mkdir(mode=0o700, parents=True, exist_ok=True)
+    folder.chmod(0o700)
+    return folder / 'user', folder / 'process.lock'
+
+
+def client_for(config, *, session_name='default', session=None, receive_updates=False,
+               auto_reconnect=False):
+    location = session if session is not None else str(session_paths(session_name)[0])
+    return TelegramClient(location, config['api_id'], config['api_hash'],
                           timeout=20, request_retries=0, connection_retries=2,
-                          retry_delay=2, auto_reconnect=False, flood_sleep_threshold=0,
-                          receive_updates=False, raise_last_call_error=True)
+                          retry_delay=2, auto_reconnect=auto_reconnect, flood_sleep_threshold=0,
+                          receive_updates=receive_updates, raise_last_call_error=True)
 
 
 async def login(client):
@@ -639,7 +651,9 @@ async def execute(args, store):
         print(json.dumps(report, ensure_ascii=False, indent=2))
         return 0 if report['result'] == 'COMPLETE_VERIFIED' else 2
     config = load_config(interactive=args.command == 'login')
-    client = client_for(config)
+    session_name = getattr(args, 'session', 'default')
+    client = (client_for(config) if session_name == 'default'
+              else client_for(config, session_name=session_name))
     await rpc(client.connect)
     try:
         if args.command == 'login':
@@ -726,6 +740,7 @@ async def execute(args, store):
 def parser():
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument('--data', type=Path, default=BASE / 'archive', help='local archive directory (relative to the current directory)')
+    p.add_argument('--session', default='default', help='named Telegram session; each name has an independent session file and lock')
     subs = p.add_subparsers(dest='command', required=True)
     subs.add_parser('login', help='local interactive credentials, code and 2FA')
     r = subs.add_parser('resolve', help='resolve exact target without joining')
@@ -746,8 +761,9 @@ def main():
     args = parser().parse_args()
     args.data = cli_path(args.data)
     private_init()
-    # One process per session/project; avoids competing cursors and SQLite sessions.
-    with (PRIVATE / 'process.lock').open('a') as lock:
+    # A session is exclusive; independent sessions can work in separate data roots.
+    _, lock_path = session_paths(args.session)
+    with lock_path.open('a') as lock:
         try:
             fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
         except BlockingIOError:

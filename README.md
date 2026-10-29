@@ -64,6 +64,21 @@ python pipeline.py reopen --drama-id UUID
 
 `--only/--first` 指定任一集会扩展到整部剧；`--limit` 是视频数量软目标，当前剧完整纳入后才停止接新剧；`--drama-limit` 直接限制剧数。旧 `archive.py sample/backfill/resume/retry` 保留本地归档用途，不套用新筛选和整剧调度。本轮只实现和测试这些流程，没有执行真实 Telegram 运行或付费 AI 调用。
 
+## 扫描与本地下载审计并行
+
+默认会话沿用 `.private/user.session` 和 `.private/process.lock`。需要与现有扫描并行时，先为下载审计建立独立授权：
+
+```sh
+python scripts/diagnostics/create_telegram_session.py --name download-audit --interactive
+python scripts/diagnostics/audit_download_completeness.py --session download-audit --output archive/download-audit-本次目录
+```
+
+新会话保存在 `.private/sessions/download-audit/user.session`，使用独立锁和不同的授权密钥，不复制正在使用的会话数据库。初始化只读已有授权以接受 Telegram 登录令牌；若要求二步验证，密码仅在本机终端隐藏输入，不写入报告。完成后可重复使用该命名会话。
+
+`archive.py` 也支持把 `--session 名称` 放在子命令前；并行任务必须使用不同的会话名称和数据目录。同名会话仍串行。会话隔离不隔离同账号的 Telegram 限流、本机磁盘或网络带宽。`pipeline.py` 的会话选择未扩展。
+
+本地下载审计可用相同 `--output` 续跑，固定抽样清单不变。启动时保存旧报告和状态快照，重新校验本次已成功的文件后跳过，未完成文件按已有字节续传；旧的连接错误会恢复为待处理，原始错误和累计尝试次数仍保留。每个视频最多 5 次有效尝试，连接中断另记。仅审计入口启用有上限的自动重连；仍有连接错误时保存进度并停止，不将后续剧连续记为清单失败。存在未完成清单核查的剧时，报告状态为 `incomplete`，不能视为完成全部样本。
+
 ## 目录
 
 ```text

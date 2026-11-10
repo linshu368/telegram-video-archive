@@ -14,7 +14,7 @@ from unittest.mock import AsyncMock, Mock, patch
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 import video_archive.telegram.archive as archive
 from video_archive.core import (Store, StopArchive, classify, clean, cover_filename, disk_check,
-                  filename, pick_thumb, record_message, validate_cover, validate_file)
+                  extract_text, filename, pick_thumb, record_message, validate_cover, validate_file)
 from telethon import errors, types
 
 
@@ -85,6 +85,22 @@ class FakeClient:
         file.seek(0)
         file.write(self.content)
         await progress_callback(len(self.content), len(self.content))
+
+
+class EpisodeTests(unittest.TestCase):
+    def test_caption_markers_and_label_precedence(self):
+        examples = {'标题旁 第5集': '5', '第二季 第一集': '1', '第一百零二集': '102',
+                    '《剧名》 EP03': '3', 'ep. 004': '4', 'ＥＰ０５': '5', '剧名 09集': '9',
+                    '第5集（共30集）': '5', 'EP05 第五集': '5', '集数：特别篇\n第3集': '特别篇'}
+        for caption, expected in examples.items():
+            with self.subTest(caption=caption):
+                self.assertEqual(extract_text(caption)['episode'], expected)
+
+    def test_ranges_totals_and_unmarked_numbers_do_not_identify_one_episode(self):
+        for caption in ('1', '1080P', '共30集', '全十集', '更新至第20集', '50集全', '第4到第7集',
+                        'EP01-03', '第一集、第二集', 'EP1 EP2', 'STEP02', '3.5集', '年度5集锦', ''):
+            with self.subTest(caption=caption):
+                self.assertEqual(extract_text(caption)['episode'], '')
 
 
 class ArchiveTests(unittest.IsolatedAsyncioTestCase):

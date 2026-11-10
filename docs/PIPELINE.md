@@ -1,10 +1,24 @@
 # v2 pipeline：实现、验收边界与操作
 
-当前目录与脚本位置见 [项目结构](STRUCTURE.md)。代码按用途分组，下载队列按整剧推进；视频下载、上传、校验和缓存清理内核保持原实现。下文历史记录中的旧机器路径和运行事实不改写。
+当前目录与脚本位置见 [项目结构](STRUCTURE.md)。代码按用途分组，下载队列按整剧推进；视频归档按入库时确定的存储服务验收。下文历史记录中的旧机器路径和运行事实不改写。
 
 ## 完整主流程与整剧处理（2026-10-28，当前入口）
 
-默认 `run` 串联完整源扫描、整剧筛选、下载补齐验收、合格剧 AI 生成与事务回写、已有 faststart 待办和最终封存。`plan/batch/retry/repair/ai/transcode-backlog` 保留为分阶段入口。剧的完整成员以 **Telegram 原始话题在冻结边界内、当前 API 可访问的全部视频**为准，生产库、本地视频池和旧 `topics.json` 不决定剧清单。旧的数量与留存率需要重新扫描后计算。本轮没有执行真实源扫描、生产下载或部署；下文带日期的授权、运行状态和验收数量是历史记录。
+默认 `run` 串联完整源扫描、整剧筛选、下载补齐验收、合格剧 AI 生成与事务回写和最终封存。`plan/batch/retry/repair/ai/transcode-backlog` 保留为分阶段入口。剧的完整成员以 **Telegram 原始话题在冻结边界内、当前 API 可访问的全部视频**为准，生产库、本地视频池和旧 `topics.json` 不决定剧清单。旧的数量与留存率需要重新扫描后计算。本轮没有执行真实源扫描、生产下载或部署；下文带日期的授权、运行状态和验收数量是历史记录。
+
+### Cloudflare Stream
+
+**上线顺序**。确认目标库已应用 001 到 008，在切换 worker 前停止旧 worker，再为该库单独应用 `migrations/009_cloudflare_stream.sql`。新 worker 校验数据库函数契约。迁移保留所有既有行（包括尚未上传的行）的 `supabase` 标记，之后首次导入的行使用 `cloudflare_stream`。同一集的扫描、补齐和重试沿用首次选择。
+
+**配置**。按 `config/examples/cloudflare.example.json` 准备 `.private/cloudflare.json`，填入开通 Stream 的账户 ID 和对该账户具备 Stream 读写权限的 API token。私有目录权限为 0700，文件为 0600。此文件只用于归档 API；App 的播放签名私钥由消费端后端保管。Telegram 封面仍使用原 Supabase 封面桶。
+
+**验收**。上传完成后，`pipeline_tasks` 的 `upload` 行保存临时 UID、已校验原片的字节数与 SHA-256。此时 `videos.stream_uid` 仍为空。`stream_process` 核对远端 UID、项目、内部视频身份和私有标记；当 `status.state=ready`、`readyToStream=true`、`status.pctComplete=100` 同时成立，事务写入 `videos.stream_uid`、`stream_ready_at` 并完成任务。报告中的 `stream_processing` 是待完成，即使只剩一集也不能当作最终缺集。每次领取最多轮询约五分钟，正常等待不消耗失败次数。后续补齐轮次或再次运行 `run`、`repair` 会继续查询同一 UID。只有 `stream_ready` 后，`--cleanup` 才可清理已验证的本地原片。AI 优先读取原片；已清理时，归档 worker 为 AI 临时获取私有 Stream 输入，用于抽帧和转录。
+
+**恢复**。DB 在发出 TUS 创建请求前记录创建意图。Stream 资产的 creator 包含项目和内部视频 ID，meta 同时记录这两项与源 SHA-256。已知 TUS 地址时按远端 offset 续传。创建响应丢失时，使用 creator 查找并核对唯一匹配的资产。若没有唯一匹配，或只找到未传完的资产且续传地址已丢失，任务留在 `stream_reconciliation_pending`，保留本地文件。处理这类记录时先在相同账户核对 creator、meta、上传会话和状态。
+
+**App 对接**。按 `videos.storage_provider` 分支。旧视频使用原 `object_path`；新视频只有正式 `stream_uid`、`stream_ready_at` 存在时才可展示为可播放。新资产要求签名。在返回剧集详情时，App 后端用本地保存的签名私钥生成短期播放地址；客户端直接使用返回的地址。签名私钥只保存在 App 服务端。具体 HLS 播放实现由消费端负责。
+
+视频的 `episode` 是文本字段。显式「集数」标签优先；「第十二集」「EP12」「12集」等单集标记统一写入 `12`。缺少标记、出现互相矛盾的集号或仅描述合集范围时留空。剧与频道的归属仍取自 Telegram 话题。
 
 ### 默认 `run` 全链路
 
@@ -18,10 +32,9 @@ python pipeline.py run --drama-concurrency 2 --concurrency 4
 
 1. 完整源元数据扫描，只发现话题和成员，不下载媒体。
 2. 按当前项目的已处理池排除已封存来源/话题，再执行整剧画质硬筛。
-3. 合格剧进入剧通道，完成下载、上传、读回、有界补齐和最终下载验收。
+3. 合格剧进入剧通道，完成下载校验、上传、有界补齐和交付验收。首次入库的视频等待 Stream 转码就绪，原 Supabase 视频继续读回校验。
 4. 下载验收通过的剧生成 AI 标题、标签和简介，通过现有事务接口写回数据库；已经成功提交的 AI 任务直接复用。
-5. AI 之后沿用现有逻辑处理历史 faststart 待办，完成后提交状态。新视频没有转码任务时按“不适用”处理，不新增转换任务；视频封面仍须完成或明确无缩略图。
-6. AI、封面和实际存在的后处理任务全部完成后，将剧写入已处理池，之后默认跳过。没有转码任务不会让剧一直待定。
+5. 确认 AI 已提交、封面已完成或 Telegram 无缩略图，再把剧写入已处理池。历史 faststart 待办仅由手动命令处理。
 
 显式复用已有有效完整源扫描：
 
@@ -126,7 +139,7 @@ python pipeline.py repair
 
 `archive/pipeline/projects/<project_ref>/drama-outcomes.json`
 
-`ai`、`transcode-backlog` 及归档后的自动转码只接收已判定通过（`complete` 或 `accepted_with_gaps`）且与当前完整 manifest 一致的剧。拒绝、`pending` 或从未评定的旧数据不进入；旧数据可先运行 `repair`，全齐时无需重下载即可完成审计。后续只处理已经完成云端提交的视频，缺失成员继续留在清单中。
+`ai` 和手动的旧视频 `transcode-backlog`只接收已判定通过（`complete` 或 `accepted_with_gaps`）且与当前完整 manifest 一致的剧。拒绝、`pending` 或从未评定的旧数据不进入；旧数据可先运行 `repair`，全齐时无需重下载即可完成审计。后续只处理已经完成云端提交的视频，缺失成员继续留在清单中。
 
 拒绝或待定不会物理删除已经上传的云端对象，本地缓存仍按原验证与清理条件处理。`batch/run/retry/repair` 每次先验证源完整性和画质条件；旧 `archive.py sample/backfill/resume/retry` 保留本地归档用途，不套用新筛选、剧通道或最终缺失率判定。
 
@@ -140,11 +153,11 @@ python pipeline.py repair
 |---|---|
 | `screening_rejected` | 整剧画质条件已明确拒绝 |
 | `download_rejected` | 下载补齐已结束，整剧被最终拒绝 |
-| `completed` | 下载验收通过、AI 成功事务提交、已下载视频封面完成或无缩略图，且实际存在的后处理任务全部完成；无转码任务为不适用 |
+| `completed` | 下载验收通过、AI 成功事务提交、已下载视频封面完成或无缩略图，已交付的 Stream 视频全部就绪 |
 
 `complete` / `accepted_with_gaps` 是下载验收结论，不能单独视为完整流程的 `completed`。只有所有后续阶段也完成，才封存为 `completed`。
 
-临时断网、信息不足、预算或大小限制暂缓、AI 失败、封面或已有 faststart 任务待完成不入池，下次沿用已有进度继续。已成功提交的 AI 任务不会在重跑时重新付费生成。源目录扫描仍做完整发现；执行入口在后续画质评估或媒体处理之前按池排除已处理剧，纯离线 `plan` 不受池影响。
+临时断网、信息不足、预算或大小限制暂缓、AI 失败、封面或 Stream 编码待完成不入池，下次沿用已有进度继续。已成功提交的 AI 任务不会在重跑时重新付费生成。源目录扫描仍做完整发现；执行入口在后续画质评估或媒体处理之前按池排除已处理剧，纯离线 `plan` 不受池影响。
 
 池子按来源和原始话题识别剧，不因话题新增视频自动失效：一旦入池，同一话题后续新增视频也默认跳过。需要再次处理时手动解除：
 

@@ -365,7 +365,7 @@ class CacheTests(unittest.TestCase):
         store = Store(self.root)
         store.ingest([r], 6559, 6558, [6558])
         client = FakeClient([])
-        result = asyncio.run(archive.download_one(client, None, SOURCE, store, r, store.videos()[0][1]))
+        result = asyncio.run(archive.download_one(client, None, SOURCE, store, r, next(iter(store.videos()))[1]))
         self.assertEqual(result, 'cloud_archived_skipped')
         self.assertEqual(client.downloads, 0)
         store.db.close()
@@ -390,6 +390,8 @@ class TusDouble(Storage):
     def request(self, method, url, body=None, headers=None):
         self.check_url(url)
         if method == 'GET':
+            if url == self.base + '/bucket/drama-videos':
+                return Response(json.dumps({'public': False, 'file_size_limit': self.limit}).encode())
             if self.content is None:
                 raise HTTPError(url, 404, 'not found', {}, None)
             return Response(self.content)
@@ -596,8 +598,17 @@ class PostgresTests(unittest.TestCase):
         cls.owner.execute('DROP SCHEMA IF EXISTS drama_archive CASCADE')
         for name in ('001_pipeline.sql', '002_archived_messages.sql',
                      '003_import_video_concurrency.sql', '004_cover.sql',
-                     '005_transcode.sql', '006_regenerate_transcode.sql', '007_drama_ai.sql'):
+                     '005_transcode.sql', '006_regenerate_transcode.sql', '007_drama_ai.sql',
+                     '008_video_dimensions.sql'):
             cls.owner.execute((BASE / 'migrations' / name).read_text())
+        legacy_drama, legacy_video = fixture()
+        from psycopg.types.json import Jsonb
+        cls.owner.execute('SELECT drama_archive.import_video(%s,%s)', (Jsonb(legacy_drama), Jsonb(legacy_video)))
+        cls.owner.execute((BASE / 'migrations/009_cloudflare_stream.sql').read_text())
+        cls.owner.execute('SELECT drama_archive.import_video(%s,%s)', (Jsonb(legacy_drama), Jsonb(legacy_video)))
+        legacy = cls.owner.execute('SELECT drama_archive.video_state(%s)', (legacy_video['id'],)).fetchone()[0]
+        if legacy['storage_provider'] != 'supabase' or 'stream_process' in legacy['tasks']:
+            raise AssertionError('migration changed an existing video')
         cls.db = Database(cls.dsn + " options='-c role=drama_worker'")
         cls.login = 'drama_test_' + uuid.uuid4().hex[:12]
         cls.owner.execute(psycopg.sql.SQL('CREATE ROLE {} LOGIN NOSUPERUSER NOBYPASSRLS').format(
@@ -616,6 +627,11 @@ class PostgresTests(unittest.TestCase):
     def setUp(self):
         self.owner.execute('TRUNCATE drama_archive.pipeline_tasks,drama_archive.drama_tasks,'
                            'drama_archive.ai_results,drama_archive.videos,drama_archive.dramas')
+        # Existing tests exercise the original Supabase path with fresh fixtures.
+        # Stream tests use the actual migrated default for every new row.
+        if not self._testMethodName.startswith('test_stream_'):
+            self.owner.execute("ALTER TABLE drama_archive.videos ALTER storage_provider SET DEFAULT 'supabase'")
+            self.addCleanup(self.owner.execute, "ALTER TABLE drama_archive.videos ALTER storage_provider SET DEFAULT 'cloudflare_stream'")
         self.d, self.v = fixture()
         self.vid = self.v['id']
         self.db.call('import_video', self.d, self.v)
@@ -643,6 +659,82 @@ class PostgresTests(unittest.TestCase):
 
     def cover_path(self):
         return cover_object_path(self.vid)
+
+    def test_stream_import_fills_missing_episode_and_preserves_known_value(self):
+        from video_archive.core import extract_text
+        for caption in ('剧名 第十二集', 'EP13', ''):
+            video = {**self.v, 'episode': extract_text(caption)['episode'] or None}
+            self.db.call('import_video', self.d, video)
+            self.assertEqual(self.db.state(self.vid)['episode'], '12')
+
+    def test_stream_upload_and_ready_are_separately_fenced(self):
+        vid, uid = self.vid, 'ab' * 16
+        self.assertEqual(self.db.state(vid)['storage_provider'], 'cloudflare_stream')
+        self.complete('download')
+        token = self.db.claim(vid, 'upload')
+        self.assertTrue(self.db.call('stream_create_intent', vid, token, True))
+        self.assertFalse(self.db.call('stream_create_intent', vid, token, True))
+        self.db.call('finish', vid, 'upload', token, {'uid': uid, 'source_bytes': 30, 'source_sha256': 'a'*64})
+        self.assertIsNone(self.db.state(vid)['stream_uid'])
+        self.assertFalse(self.db.archived_messages())
+        self.assertIsNone(self.db.call('ai_source_video', self.d['id']))
+        self.assertIsNone(self.db.claim(self.d['id'], 'ai'))
+        token = self.db.claim(vid, 'stream_process')
+        self.db.call('finish', vid, 'stream_process', token, {'pending': 'encoding'})
+        self.assertEqual(self.db.state(vid)['tasks']['stream_process']['attempts'], 0)
+        token = self.db.claim(vid, 'stream_process')
+        ready = {'uid': uid, 'state': 'ready', 'pctComplete': 100, 'readyToStream': True, 'requireSignedURLs': True}
+        for change in ({'pctComplete': 99}, {'uid': 'f'*32}, {'requireSignedURLs': False}):
+            with self.assertRaises(Exception):
+                self.db.call('finish', vid, 'stream_process', token, {**ready, **change})
+            self.assertIsNone(self.db.state(vid)['stream_uid'])
+        self.db.call('finish', vid, 'stream_process', token, ready)
+        self.assertEqual(self.db.state(vid)['stream_uid'], uid)
+        self.assertEqual(self.db.archived_messages(), {int(self.v['message_id'])})
+        self.assertEqual(str(self.db.call('ai_source_video', self.d['id'])), vid)
+        self.assertIsNone(self.db.claim(vid, 'transcode'))
+        self.complete('ai', {'tags': [], 'source_video_id': vid})
+        self.assertEqual(self.db.state(vid)['tasks']['ai']['status'], 'succeeded')
+
+    def test_stream_batch_resumes_encoding_without_copying_media_again(self):
+        import subprocess
+        from video_archive.pipeline.batch import process_batch
+        with tempfile.TemporaryDirectory() as tmp:
+            store = Store(tmp)
+            self.addCleanup(store.db.close)
+            src = Path(tmp) / 'fixture.mp4'
+            subprocess.run(['ffmpeg', '-nostdin', '-v', 'error', '-f', 'lavfi', '-i',
+                            'color=s=64x64:d=0.2', '-c:v', 'mpeg4', str(src)], check=True)
+            data = src.read_bytes()
+            msg = message(901, len(data), name='901.mp4')
+            record = record_message(msg, SOURCE)
+            store.ingest([record], 902, 901, [901])
+            drama, video = fixture(901, source=SOURCE['id'])
+            video['media_id'] = str(record['media_id'])
+            jobs = [(drama, video, record, next(iter(store.videos()))[1])]
+            cache = Cache(tmp, project_ref=PROJECT)
+            telegram = FakeClient([msg], data)
+            storage = Mock()
+            storage.upload_cover.return_value = 'cover-receipt'
+            uid = 'a9'*16
+            ready = {'uid': uid, 'state': 'ready', 'readyToStream': True, 'pctComplete': 100, 'requireSignedURLs': True}
+            with patch('video_archive.pipeline.batch.stream_config'), patch('video_archive.pipeline.runner.Stream') as client:
+                client.return_value.upload.return_value = uid
+                client.return_value.wait_ready.side_effect = [None, ready]
+                def run():
+                    return asyncio.run(process_batch(self.db, storage, cache, store, telegram,
+                                                     None, SOURCE, jobs, cleanup=True, project_ref=PROJECT))
+                waiting = run()['videos'][0]
+                self.assertEqual(waiting['result'], 'stream_processing', waiting)
+                self.assertTrue((Path(tmp) / 'videos' / filename(record)).is_file())
+                self.assertIsNone(self.db.state(video['id'])['stream_uid'])
+                ready_entry = run()['videos'][0]
+                self.assertEqual(ready_entry['result'], 'stream_ready', ready_entry)
+                self.assertEqual(ready_entry['stream_uid'], uid)
+                self.assertTrue(ready_entry['local_cleaned'])
+                self.assertEqual(telegram.downloads, 1)
+                client.return_value.upload.assert_called_once()
+                storage.upload.assert_not_called()
 
     def test_cover_stages_are_independent_of_the_video_stages(self):
         state = self.db.state(self.vid)
@@ -1004,7 +1096,7 @@ class PostgresTests(unittest.TestCase):
             msg = message(6558, len(content))
             r = record_message(msg, SOURCE)
             store.ingest([r], 6559, 6558, [6558])
-            state = store.videos()[0][1]
+            state = next(iter(store.videos()))[1]
             d, v = fixture(source=SOURCE['id'])
             self.db.call('import_video', d, v)
             client = FakeClient([msg], content)

@@ -75,6 +75,19 @@ class SourceSnapshotTests(unittest.TestCase):
             self.assertEqual(rows[0][1]['bitrate_bps'], 3_200_000)
             self.assertEqual(rows[0][0]['title'], 'source drama')
 
+    def test_cached_caption_populates_episode_in_import_payload(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            records, _ = source_inventory(tmp)
+            store = Store(tmp)
+            with store.db:
+                for record, caption in zip(records, ('第二十一集', '宣传 共21集')):
+                    record.update(episode='', text=caption)
+                    store.db.execute('UPDATE messages SET data=? WHERE id=?',
+                                     (json.dumps(record), record['message_id']))
+            store.db.close()
+            rows, _ = snapshot(tmp, Path(tmp) / 'unused.json', require_complete=True)
+            self.assertEqual([video['episode'] for _, video, _, _ in rows], ['21', None])
+
     def test_source_member_missing_from_local_metadata_never_shrinks_drama(self):
         with tempfile.TemporaryDirectory() as tmp:
             _, proof = source_inventory(tmp)

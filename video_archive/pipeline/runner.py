@@ -17,9 +17,10 @@ from pathlib import Path
 from video_archive.core import atomic_json, cover_filename, filename, now, sha256, validate_file
 from video_archive.pipeline.cache import Cache, legacy_entry
 from video_archive.pipeline.common import (BASE, PipelineError, ai_output, config, cover_object_path,
-                             error_code, identity, object_path, snapshot)
+                             error_code, identity, is_stream, object_path, snapshot, video_committed)
 from video_archive.pipeline.db import Database, Lease
 from video_archive.pipeline.storage import Storage
+from video_archive.pipeline.stream import Stream, stream_config
 from video_archive.pipeline.outcomes import outcome_file, filter_approved_rows
 from video_archive.paths import cli_path
 from video_archive.screening.quality import QualityPolicy
@@ -112,7 +113,7 @@ def committed_inventory(db, rows):
         if cover_path and cover_path != cover_object_path(video['id']):
             raise PipelineError('archive_identity_conflict')
         tasks = cloud.get('tasks') or {}
-        if not path or (tasks.get('upload') or {}).get('status') != 'succeeded':
+        if not video_committed(cloud, video['id']):
             return None
         cover_done = (all((tasks.get(stage) or {}).get('status') == 'succeeded'
                           for stage in ('cover_download', 'cover_upload'))
@@ -133,6 +134,15 @@ def sample_evidence(db, cache, video, record):
     """
     cloud, entry = db.state(video['id']), cache.get(video['id'])
     verify_identity(video, record, cloud)
+    if is_stream(cloud):
+        if not video_committed(cloud, video['id']):
+            raise PipelineError('stream_not_ready')
+        upload = cloud['tasks']['upload']
+        return {'message_id': record['message_id'], 'video_id': video['id'], 'drama_id': video['drama_id'],
+                'storage_provider': cloud['storage_provider'], 'stream_uid': cloud['stream_uid'],
+                'bytes': upload['source_bytes'], 'local_sha256': upload['source_sha256'],
+                'stream_ready_at': cloud['stream_ready_at'], 'stream_process_status': 'succeeded',
+                'upload_status': 'succeeded', 'ai_status': cloud['tasks']['ai']['status']}
     if (cloud.get('object_path') != object_path(video['id'])
             or cloud['tasks']['upload']['status'] != 'succeeded'
             or not entry.get('sha256') or entry.get('sha256') != entry.get('remote_sha256')):
@@ -151,6 +161,8 @@ def archive_existing(db, storage, cache, video, record, state, decode=True, *, c
         cloud = db.state(vid)
         verify_identity(video, record, cloud)
         if cloud and cloud['tasks']['upload']['status'] == 'succeeded':
+            if is_stream(cloud):
+                return 'stream_ready' if video_committed(cloud, vid) else 'stream_uploaded'
             if cloud['object_path'] != object_path(vid):
                 raise PipelineError('archive_state_conflict')
             entry = cache.get(vid)
@@ -180,6 +192,18 @@ def archive_existing(db, storage, cache, video, record, state, decode=True, *, c
             def active():
                 check()
                 lease.check()
+            if is_stream(cloud):
+                client = Stream(cache.directory.name)
+                try:
+                    uid = client.upload(vid, path, result['sha256'], cache, lease, active)
+                except PipelineError as exc:
+                    if str(exc) != 'stream_reconciliation_pending':
+                        raise
+                    lease.finish({'pending': 'reconciliation'})
+                    return 'stream_reconciliation_pending'
+                active()
+                lease.finish({'uid': uid, 'source_bytes': result['actual_size'], 'source_sha256': result['sha256']})
+                return 'stream_uploaded'
             actual = storage.upload(vid, path, result['sha256'], cache, active,
                                     record.get('mime_type') or 'application/octet-stream',
                                     **({'metrics': metrics} if metrics is not None else {}))
@@ -189,6 +213,24 @@ def archive_existing(db, storage, cache, video, record, state, decode=True, *, c
             lease.finish({'object_path': object_path(vid)})
             cache.put(vid, archived=True, object_path=object_path(vid))
         return 'uploaded_readback_verified'
+
+
+def process_stream(db, cache, vid, *, check=lambda: None):
+    cloud = db.state(vid)
+    if video_committed(cloud, vid):
+        return 'stream_ready'
+    client = Stream(cache.directory.name)
+    with Lease(db, vid, 'stream_process') as lease:
+        def active():
+            check()
+            lease.check()
+        ready = client.wait_ready(vid, cloud['tasks']['upload'], active)
+        active()
+        if ready is None:
+            lease.finish({'pending': 'encoding'})
+            return 'stream_processing'
+        lease.finish(ready)
+        return 'stream_ready'
 
 
 async def download_task(db, cache, video, record, state, client, peer, source, store, *,
@@ -202,7 +244,7 @@ async def download_task(db, cache, video, record, state, client, peer, source, s
     with cache.lock(vid):
         check()
         cloud = await asyncio.to_thread(db.state, vid)
-        if cloud['object_path'] and cloud['tasks']['upload']['status'] == 'succeeded':
+        if video_committed(cloud, vid) or is_stream(cloud) and cloud['tasks']['upload']['status'] == 'succeeded':
             return 'cloud_archived_skipped'
         with cache.reserve(vid, record['expected_size']):
             async with Lease(db, vid, 'download') as lease:
@@ -294,6 +336,8 @@ def transcode_task(db, storage, cache, vid, *, check=lambda: None):
     overwrites the cloud copy when the bytes actually changed, so a video that
     was already faststart costs one readback and no upload.
     """
+    if is_stream(db.state(vid)):
+        return 'stream_transcode_not_applicable'
     from video_archive.pipeline.transcode import remux_faststart
     scratch = cache.directory / 'scratch'
     scratch.mkdir(mode=0o700, exist_ok=True)
@@ -339,14 +383,21 @@ def ai_input(db, storage, cache, vid, check):
         # Fill gaps from the pre-project-scoping cache; the live project's own
         # record (if any) always wins. Never used to decide archived/not-archived.
         entry = {**legacy_entry(cache.root, vid), **cache.get(vid)}
+        state = db.state(vid)
+        if is_stream(state) and not video_committed(state, vid):
+            raise PipelineError('stream_not_ready')
         if entry.get('path'):
             path = cache.path(entry)
-            if path.exists() and sha256(path) == entry.get('sha256'):
+            expected = state['tasks']['upload']['source_sha256'] if is_stream(state) else entry.get('sha256')
+            if path.exists() and sha256(path) == expected:
                 yield path
                 return
+        if is_stream(state):
+            check()
+            yield Stream(cache.directory.name).ai_media(state['stream_uid'])
+            return
         if not entry.get('size') or not entry.get('sha256'):
             raise PipelineError('local_integrity_record_missing')
-        state = db.state(vid)
         if not state.get('object_path') or state['tasks']['upload']['status'] != 'succeeded':
             raise PipelineError('archive_not_committed')
         scratch = cache.directory / 'scratch'
@@ -440,7 +491,7 @@ def main():
     parser.add_argument('--batch-size', type=int, default=100, help='download: videos per segment (1..500; default 100)')
     parser.add_argument('--concurrency', type=int, default=4, choices=range(1, 9))
     parser.add_argument('--transcode-concurrency', type=int, default=2, choices=range(1, 5),
-                        help='run: concurrent transcode-backlog workers after the normal pass')
+                        help=argparse.SUPPRESS)
     parser.add_argument('--cleanup', action='store_true', help='batch: delete local file after verified cloud commit')
     parser.add_argument('--cache-high-gb', type=int, default=10, choices=range(1, 41))
     args = parser.parse_args()
@@ -494,9 +545,10 @@ def main():
             return 0
         if args.command == 'check':
             c = config(args.config)
+            stream_config()
             # Do not infer live plan/region from supplied values.
             storage = Storage(c)
-            print(json.dumps({'configuration': 'valid', 'live_project_verified': False,
+            print(json.dumps({'configuration': 'valid', 'stream_configured': True, 'live_project_verified': False,
                               'database': Database(c['database_dsn']).verify_worker(),
                               'bucket': storage.bucket(), 'cover_bucket': storage.cover_bucket()}))
             return 0
@@ -586,8 +638,6 @@ def main():
                     from video_archive.pipeline.workflow import source_session_lock
                     resources.enter_context(source_session_lock())
             db, storage = Database(c['database_dsn']), Storage(c)
-            if args.command == 'samples' and max(r[2]['expected_size'] for r in samples) > min(c['global_file_limit'], c['bucket_file_limit']):
-                raise PipelineError('sample_exceeds_project_limit')
             if args.command == 'migrate':
                 # Configure owner DSN temporarily for this operation, then restricted login.
                 import psycopg
@@ -614,8 +664,15 @@ def main():
             elif args.command in ('batch', 'run', 'retry', 'repair'):
                 from video_archive.pipeline.batch import run_batch, plan_dramas, retry_plan_dramas
                 permissions = db.verify_worker()
-                storage.bucket()
                 storage.cover_bucket()
+                # Only previously imported Supabase videos are bound by the video bucket size.
+                max_bytes = args.max_video_mib * 1024**2
+                legacy_large = set()
+                for _, video, record, _ in rows:
+                    if storage.limit < (record.get('expected_size') or 0) <= max_bytes:
+                        state = db.state(video['id'])
+                        if state and not is_stream(state):
+                            legacy_large.add(video['id'])
                 archived, covered = committed_inventory(db, rows)
                 # Carried for their cover only: their video object is already committed.
                 cover_only = {mid for mid in archived if mid not in covered}
@@ -626,13 +683,13 @@ def main():
                         skip_drama_ids={entry['drama_id'] for entry in pool_skipped},
                         skip_message_ids=skipped_message_ids,
                         include_deferred=args.include_deferred,
-                        max_bytes=args.max_video_mib * 1024**2, bucket_limit=storage.limit,
+                        max_bytes=args.max_video_mib * 1024**2, bucket_limit=storage.limit, bucket_members=legacy_large,
                         video_limit=args.limit, drama_limit=args.drama_limit)
                 else:
                     jobs, deferred, evaluations = plan_dramas(
                         rows, args.data, archived, quality_policy=quality_policy,
                         only=args.only, first=args.first, max_bytes=args.max_video_mib * 1024**2,
-                        bucket_limit=storage.limit, covered=covered, cover_only=cover_only,
+                        bucket_limit=storage.limit, bucket_members=legacy_large, covered=covered, cover_only=cover_only,
                         video_limit=args.limit, drama_limit=args.drama_limit,
                         resume_partials=args.command in ('run', 'repair'),
                         defer_ids=() if args.command == 'repair' else (3021,),
@@ -682,11 +739,9 @@ def main():
                                    report_path=path)
                 atomic_json(path, report)
                 ai_report, ai_path, completed = None, None, []
-                transcode_report, transcode_path = None, None
                 # Only after a clean run: a pass that already hit a hard stop
                 # (flood/disk/db) should not take on more network work on top.
                 if args.command == 'run' and not report.get('stop_reason'):
-                    from video_archive.pipeline.batch import drain_transcode, select_ai_candidates
                     selected_rows = filter_approved_rows(
                         outcome_file(args.data, c['project_ref']), c['project_ref'], rows)
                     from video_archive.pipeline.workflow import process_ai, finalize_processed
@@ -697,12 +752,6 @@ def main():
                                            provider=provider, report_path=ai_path)
                     report['ai_called'] = any(entry['result'] == 'ai_succeeded'
                                               for entry in ai_report['results'])
-                    committed, _ = committed_inventory(db, selected_rows)
-                    candidates = select_ai_candidates(selected_rows, committed, limit=None)
-                    transcode_path = args.data / ('pipeline-transcode-' + now().replace(':', '-') + '.json')
-                    transcode_report = asyncio.run(drain_transcode(
-                        db, storage, cache, candidates,
-                        concurrency=args.transcode_concurrency, report_path=transcode_path))
                     completed = finalize_processed(db, selected_rows, path=pool_path,
                                                    project_ref=c['project_ref'], report_path=path)
                     waiting = any(entry.get('planning_status') in ('pending', 'deferred')
@@ -713,7 +762,7 @@ def main():
                         or any(entry['result'] != 'completed' for entry in completed)
                         or ai_report['status'] != 'complete' else 'complete')
                     report.update(ai_report=str(ai_path), ai_results=ai_report['results'],
-                                  transcode_report=str(transcode_path), processed_results=completed)
+                                  processed_results=completed)
                     atomic_json(path, report)
                 print(json.dumps({'status': report['status'], 'report': str(path),
                                   'drama_selection_report': str(selection_path),
@@ -734,9 +783,7 @@ def main():
                                   'processed_pool_skipped': pool_skipped,
                                   **({'workflow_status': report['workflow_status'],
                                       'ai_results': ai_report['results'], 'processed_results': completed}
-                                     if ai_report is not None else {}),
-                                  **({'transcode_counts': transcode_report['counts'],
-                                      'transcode_report': str(transcode_path)} if transcode_report else {})}))
+                                     if ai_report is not None else {})}))
                 if args.command == 'run':
                     return 0 if report.get('workflow_status') == 'complete' else 2
                 return 0 if (report.get('delivery_accepted') is True
@@ -752,7 +799,6 @@ def main():
                 # Pre-flight client-privilege audit intentionally skipped here: anon/
                 # authenticated/service_role direct table access is a deliberate,
                 # kept decision (not drift), confirmed by the project owner.
-                storage.bucket()
                 from video_archive.pipeline.workflow import process_ai, finalize_processed
                 cache = Cache(args.data, project_ref=c['project_ref'])
                 ai_path = args.data / ('pipeline-ai-' + now().replace(':', '-') + '.json')
@@ -778,7 +824,9 @@ def main():
                 from video_archive.pipeline.batch import select_ai_candidates
                 cache = Cache(args.data, project_ref=c['project_ref'])
                 committed, _ = committed_inventory(db, approved_rows)
-                candidates = select_ai_candidates(approved_rows, committed, limit=args.limit)
+                legacy_rows = [job for job in approved_rows if job[2]['message_id'] in committed
+                               and not is_stream(db.state(job[1]['id']))]
+                candidates = select_ai_candidates(legacy_rows, committed, limit=args.limit)
                 results = []
                 for _, v, r, _ in candidates:
                     entry = {'message_id': r['message_id'], 'video_id': v['id']}
@@ -801,11 +849,10 @@ def main():
                 print(json.dumps({'imported_or_existing': len(rows), 'excluded': excluded}))
             elif args.command == 'samples':
                 permissions = db.verify_worker()
-                storage.bucket()
                 backup_legacy(args.data)
                 import_rows(db, samples)
                 cache = Cache(args.data, project_ref=c['project_ref'])
-                report = {'at': now(), 'project_ref': c['project_ref'], 'bucket': 'drama-videos',
+                report = {'at': now(), 'project_ref': c['project_ref'],
                           'status': 'in_progress', 'samples': [], 'permissions': permissions,
                           'ai_called': False, 'original_three_sample_gate_changed': False,
                           'dashboard_metadata_source': 'administrator_confirmation',
@@ -819,6 +866,8 @@ def main():
                 try:
                     for _, v, r, s in samples:
                         result = archive_existing(db, storage, cache, v, r, s)
+                        if result == 'stream_uploaded':
+                            result = process_stream(db, cache, v['id'])
                         report['samples'].append({**sample_evidence(db, cache, v, r), 'result': result,
                             'original_retained': local_file(args.data, r, s).is_file()})
                         save_report()

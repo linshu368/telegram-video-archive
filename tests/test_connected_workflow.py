@@ -88,7 +88,7 @@ class ConnectedWorkflowTests(unittest.TestCase):
     def test_default_run_connects_all_stages_and_second_run_skips_media_and_ai(self):
         code, output, _ = self.call()
         self.assertEqual(code, 0)
-        self.assertEqual(self.events, ['scan', 'download', 'ai', 'transcode'])
+        self.assertEqual(self.events, ['scan', 'download', 'ai'])
         self.assertEqual(self.downloads, [[11, 12]])
         self.assertEqual(output['workflow_status'], 'complete')
         pool = load_pool(processed_file(self.root, 'testref'), 'testref')
@@ -111,7 +111,7 @@ class ConnectedWorkflowTests(unittest.TestCase):
         code, output, _ = self.call()
         self.assertEqual(code, 0)
         self.assertEqual(self.downloads, [[11, 12], []])
-        self.assertEqual(self.events, ['scan', 'download', 'ai', 'transcode'])
+        self.assertEqual(self.events, ['scan', 'download', 'ai'])
 
     def test_source_scan_failure_stops_before_database_or_download(self):
         def fail(*args, **kwargs):

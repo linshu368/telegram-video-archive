@@ -12,8 +12,9 @@ from pathlib import Path
 import video_archive.telegram.archive as archive
 from video_archive.core import StopArchive, atomic_json, filename, now
 from video_archive.pipeline.runner import (archive_existing, cover_download_task, cover_upload_task,
-                      download_task, sample_evidence, transcode_task)
-from video_archive.pipeline.common import PipelineError, error_code, mark_cover_remote
+                      download_task, process_stream, sample_evidence, transcode_task)
+from video_archive.pipeline.stream import stream_config
+from video_archive.pipeline.common import PipelineError, error_code, is_stream, mark_cover_remote, video_committed
 from video_archive.pipeline.completion import (check_result_identity, check_segment, drama_progress,
                                                 manifest_digest, manifest_for_jobs, manifest_map,
                                                 read_pass_report, recover_active_segment,
@@ -23,12 +24,12 @@ MAX_BATCH = 500
 # 'video_already_committed': this pass carried the video only to reach its cover,
 # so not re-verifying the object is the expected outcome, not an incomplete one.
 SUCCESS = {'uploaded_readback_verified', 'already_archived_readback_verified',
-           'video_already_committed'}
+           'video_already_committed', 'stream_ready'}
 COVER_SUCCESS = {'cover_uploaded_readback_verified', 'already_archived', 'no_thumbnail', 'skipped'}
 
 
 def _plan_files(rows, root, archived, *, only=(), first=(), max_bytes=128 * 1024**2,
-         bucket_limit=None, defer_ids=(3021,), resume_partials=False, covered=frozenset(),
+         bucket_limit=None, bucket_members=None, defer_ids=(3021,), resume_partials=False, covered=frozenset(),
          cover_only=frozenset()):
     """Apply shared per-file eligibility checks within one candidate drama."""
     known = {r['message_id']: job for job in rows for r in [job[2]]}
@@ -57,7 +58,7 @@ def _plan_files(rows, root, archived, *, only=(), first=(), max_bytes=128 * 1024
             reason = 'explicitly_deferred'
         elif not isinstance(size, int) or size <= 0:
             reason = 'unknown_size'
-        elif bucket_limit is not None and size > bucket_limit:
+        elif bucket_limit is not None and size > bucket_limit and (bucket_members is None or job[1]['id'] in bucket_members):
             reason = 'bucket_file_limit'
         elif size > max_bytes:
             reason = 'large_video'
@@ -72,7 +73,7 @@ def _plan_files(rows, root, archived, *, only=(), first=(), max_bytes=128 * 1024
 
 
 def plan_dramas(rows, root, archived, *, quality_policy, only=(), first=(),
-                max_bytes=128 * 1024**2, bucket_limit=None, defer_ids=(3021,),
+                max_bytes=128 * 1024**2, bucket_limit=None, bucket_members=None, defer_ids=(3021,),
                 resume_partials=False, covered=frozenset(), cover_only=frozenset(),
                 video_limit=None, drama_limit=None, force_readback=True):
     """Select complete source dramas before applying any per-file transfer gate.
@@ -148,7 +149,7 @@ def plan_dramas(rows, root, archived, *, quality_policy, only=(), first=(),
         planned, member_deferred = _plan_files(
             pending, root, archived - explicit,
             first=[mid for mid in first if mid in pending_ids], max_bytes=max_bytes,
-            bucket_limit=bucket_limit, defer_ids=defer_ids, resume_partials=resume_partials,
+            bucket_limit=bucket_limit, bucket_members=bucket_members, defer_ids=defer_ids, resume_partials=resume_partials,
             covered=covered, cover_only=cover_only - explicit)
         if member_deferred:
             defer_drama(evaluation, pending, 'drama_member_deferred', member_deferred)
@@ -172,7 +173,7 @@ def plan_dramas(rows, root, archived, *, quality_policy, only=(), first=(),
 
 def retry_plan_dramas(rows, root, report_path, project_ref, *, quality_policy,
                       archived=frozenset(), covered=frozenset(), cover_only=frozenset(),
-                      include_deferred=False, max_bytes=128 * 1024**2, bucket_limit=None,
+                      include_deferred=False, max_bytes=128 * 1024**2, bucket_limit=None, bucket_members=None,
                       video_limit=None, drama_limit=None, skip_drama_ids=frozenset(),
                       skip_message_ids=frozenset()):
     """Expand durable retry candidates to their complete, freshly evaluated dramas."""
@@ -209,7 +210,7 @@ def retry_plan_dramas(rows, root, report_path, project_ref, *, quality_policy,
         return [], [], []
     jobs, deferred, evaluations = plan_dramas(
         rows, root, archived, quality_policy=quality_policy, only=ids,
-        max_bytes=max_bytes, bucket_limit=bucket_limit,
+        max_bytes=max_bytes, bucket_limit=bucket_limit, bucket_members=bucket_members,
         defer_ids=() if include_deferred else (3021,), resume_partials=True,
         covered=covered, cover_only=cover_only, video_limit=video_limit,
         drama_limit=drama_limit, force_readback=False)
@@ -220,11 +221,17 @@ def retry_plan_dramas(rows, root, report_path, project_ref, *, quality_policy,
 
 def claim_blocker(cloud):
     """Describe a stage that cannot be claimed without changing its DB state."""
-    if not cloud or cloud.get('object_path'):
+    if not cloud or cloud.get('object_path') or is_stream(cloud) and video_committed(cloud, cloud['id']):
         return None
     tasks = cloud['tasks']
     task = tasks['upload'] if tasks['download']['status'] == 'succeeded' else tasks['download']
+    if is_stream(cloud) and tasks['upload']['status'] == 'succeeded':
+        task = tasks['stream_process']
+        if task.get('attempts', 0) >= 5 and task.get('last_error') != 'stream_encoding_failed':
+            return 'stream_status_unconfirmed'
     if task.get('attempts', 0) >= 5:
+        if is_stream(cloud) and task.get('stream_create_started'):
+            return 'stream_status_unconfirmed'
         return 'attempts_exhausted'
     current = datetime.now(timezone.utc)
     if task['status'] == 'running' and task.get('lease_expires_at'):
@@ -495,6 +502,7 @@ async def process_batch(db, storage, cache, store, client, peer, source, jobs, *
     async def video_line(job, item):
         _, v, r, _ = job
         mid, vid = r['message_id'], v['id']
+        cloud = None
         try:
             active()
             if stop.is_set():
@@ -502,11 +510,13 @@ async def process_batch(db, storage, cache, store, client, peer, source, jobs, *
                 return
             state = states[mid]
             cloud = await threaded(db.state, vid)
-            if mid in cover_only and cloud.get('object_path'):
+            if mid in cover_only and video_committed(cloud, vid):
                 # Selected for its cover alone: re-reading the whole committed
                 # object would cost its full size in egress for nothing.
                 item['result'] = 'video_already_committed'
                 return
+            if is_stream(cloud) and not video_committed(cloud, vid):
+                stream_config()
             blocker = claim_blocker(cloud)
             if blocker:
                 item.update(result='retry_deferred', error=blocker)
@@ -531,6 +541,13 @@ async def process_batch(db, storage, cache, store, client, peer, source, jobs, *
                 item['result'] = 'uploading_or_verifying'
                 item['result'] = await threaded(archive_existing, db, storage, cache, v, r, state, False,
                                                 check=active, metrics=item['timings'])
+            if item['result'] == 'stream_uploaded':
+                item['upload_status'] = 'succeeded'
+                item['result'] = 'stream_processing'
+                save()
+                item['result'] = await threaded(process_stream, db, cache, vid, check=active)
+            if item['result'] in ('stream_processing', 'stream_reconciliation_pending'):
+                return
             item.update(await threaded(sample_evidence, db, cache, v, r))
             active()
             entry = await threaded(cache.get, vid)
@@ -547,7 +564,14 @@ async def process_batch(db, storage, cache, store, client, peer, source, jobs, *
                 report['stop_reason'] = code
                 stop.set()
         except Exception as exc:
-            item.update(result='failed', error=error_code(exc))
+            code = error_code(exc)
+            result = 'failed'
+            if is_stream(cloud) and item['result'] == 'uploading_or_verifying':
+                # The last PATCH or upload.finish may have committed before the response was lost.
+                result = 'stream_reconciliation_pending'
+            elif item['result'] == 'stream_processing' and code != 'stream_encoding_failed':
+                result = 'stream_processing'
+            item.update(result=result, error=code)
             if item['error'] == 'psycopg_OperationalError':
                 # An isolated connection error is a file failure. Stop intake only
                 # if a fresh health query also fails after bounded connect retries.
@@ -556,7 +580,8 @@ async def process_batch(db, storage, cache, store, client, peer, source, jobs, *
                 except Exception:
                     report['stop_reason'] = 'database_unavailable'
                     stop.set()
-            if item['error'] in ('cache_paused', 'remote_object_conflict',
+            if item['error'] in ('private_stream_config_missing', 'stream_config_incomplete', 'private_config_permissions',
+                                  'stream_identity_conflict', 'stream_permission_unavailable', 'cache_paused', 'remote_object_conflict',
                                   'archive_identity_conflict', 'bucket_configuration_conflict',
                                   'storage_permission_unavailable', 'psycopg_InsufficientPrivilege'):
                 report['stop_reason'] = item['error']

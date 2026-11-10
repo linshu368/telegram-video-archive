@@ -232,10 +232,9 @@ class SealWorkflowTests(unittest.TestCase):
         self.assertEqual(record.call_args.args[2], rows)
         self.assertEqual(record.call_args.kwargs['details']['missing_video_count'], 2)
 
-    def test_pending_ai_cover_or_applicable_transcode_never_seals(self):
+    def test_pending_ai_or_cover_never_seals(self):
         rows = jobs()
-        for stage, reason in (('ai', 'ai_pending'), ('cover_upload', 'cover_pending'),
-                              ('transcode', 'transcode_pending')):
+        for stage, reason in (('ai', 'ai_pending'), ('cover_upload', 'cover_pending')):
             with self.subTest(stage=stage):
                 db = FakeDB(rows, ai=True)
                 db.states[rows[0][1]['id']]['tasks'][stage]['status'] = 'failed'

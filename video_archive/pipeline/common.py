@@ -8,6 +8,7 @@ from collections import Counter
 from datetime import datetime, timezone
 from pathlib import Path
 
+from video_archive.core import caption_episode
 from video_archive.paths import BASE
 NAMESPACE = uuid.UUID('795ec7d2-3505-4cef-9f46-8aad88c7028b')
 
@@ -60,6 +61,21 @@ def identity(kind, source, item):
 
 def object_path(vid):
     return f'videos/{uuid.UUID(str(vid))}/original'
+
+
+def is_stream(state):
+    return bool(state and state.get('storage_provider') == 'cloudflare_stream')
+
+
+def video_committed(state, vid):
+    if not state or (state.get('tasks', {}).get('upload') or {}).get('status') != 'succeeded':
+        return False
+    if is_stream(state):
+        upload = state['tasks']['upload']
+        return bool(state.get('stream_uid') and state['stream_uid'] == upload.get('uploaded_stream_uid')
+                    and state.get('stream_ready_at')
+                    and (state['tasks'].get('stream_process') or {}).get('status') == 'succeeded')
+    return state.get('object_path') == object_path(vid)
 
 
 def cover_object_path(vid):
@@ -291,7 +307,8 @@ def snapshot(root, topics_path, *, require_complete=False):
             v = {'id': vid, 'drama_id': did, 'source_id': str(sid), 'message_id': str(mid),
                  'media_id': str(r['media_id']), 'original_title': text(r.get('title')),
                  'original_tags': tags(r.get('tags')), 'original_description': text(r.get('description')),
-                 'episode': text(r.get('episode')), **media_metadata(r, s)}
+                 'episode': text(r.get('episode')) or text(caption_episode(r.get('text') or '')),
+                 **media_metadata(r, s)}
             result.append((d, v, r, s))
         if source_members is not None and seen_members != set(source_members):
             raise PipelineError('source_topic_inventory_records_missing')

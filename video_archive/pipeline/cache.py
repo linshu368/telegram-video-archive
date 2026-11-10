@@ -8,7 +8,7 @@ from contextlib import contextmanager
 from pathlib import Path
 
 from video_archive.core import sha256
-from video_archive.pipeline.common import PipelineError, identity, object_path
+from video_archive.pipeline.common import PipelineError, identity, is_stream, object_path, video_committed
 
 
 class Cache:
@@ -122,15 +122,21 @@ class Cache:
             entry, state = self.get(vid), database.state(vid)
             if entry.get('protected'):
                 raise PipelineError('protected_sample')
-            if not state or state.get('object_path') != object_path(vid) or state['tasks']['upload']['status'] != 'succeeded' or 'ai' not in state['tasks']:
+            if not video_committed(state, vid) or 'ai' not in state['tasks']:
                 raise PipelineError('archive_not_committed')
-            if not entry.get('remote_sha256') or entry.get('remote_sha256') != entry.get('sha256'):
+            if is_stream(state):
+                if state['tasks']['upload']['source_sha256'] != entry.get('sha256'):
+                    raise PipelineError('stream_source_mismatch')
+                receipt = {'stream_uid': state['stream_uid']}
+            elif not entry.get('remote_sha256') or entry.get('remote_sha256') != entry.get('sha256'):
                 raise PipelineError('remote_not_verified')
+            else:
+                receipt = {'object_path': object_path(vid)}
             path = self.path(entry)
             if path.exists() and sha256(path) != entry['sha256']:
                 raise PipelineError('cache_changed')
             # Commit tombstone before unlink; a crash can leave an extra safe file.
-            self.put(vid, archived=True, cleaned=True, object_path=object_path(vid))
+            self.put(vid, archived=True, cleaned=True, **receipt)
             path.unlink(missing_ok=True)
 
 

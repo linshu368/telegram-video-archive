@@ -67,9 +67,9 @@ class Database:
                 FROM pg_proc p JOIN pg_namespace n ON n.oid=p.pronamespace
                 WHERE n.nspname='drama_archive'
             """).fetchall()
-            if len(funcs) != 10 or {r[1] for r in funcs} != {
+            if len(funcs) != 11 or {r[1] for r in funcs} != {
                     'import_video', 'video_state', 'archived_messages', 'claim', 'renew', 'finish', 'fail',
-                    'regenerate_ai', 'regenerate_transcode', 'ai_source_video'}:
+                    'regenerate_ai', 'regenerate_transcode', 'ai_source_video', 'stream_create_intent'}:
                 raise PipelineError('worker_function_contract_conflict')
             for _, _, definer, settings, owner, execute, public in funcs:
                 if (not definer or settings != ['search_path=pg_catalog, drama_archive']
@@ -91,7 +91,7 @@ class Database:
 
     def call(self, name, *args):
         allowed = {'import_video', 'video_state', 'archived_messages', 'claim', 'renew', 'finish', 'fail',
-                   'regenerate_ai', 'regenerate_transcode', 'ai_source_video'}
+                   'regenerate_ai', 'regenerate_transcode', 'ai_source_video', 'stream_create_intent'}
         if name not in allowed:
             raise PipelineError('invalid_database_operation')
         slots = self.heartbeat_slots if name == 'renew' else self.slots

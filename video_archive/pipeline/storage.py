@@ -43,6 +43,7 @@ class Storage:
         self.limit = min(c['global_file_limit'], c['bucket_file_limit'])
         self.cover_limit = min(COVER_LIMIT, c['global_file_limit'])
         self.opener = build_opener(NoRedirect())
+        self.video_bucket_checked = False
 
     def request(self, method, url, body=None, headers=None):
         self.check_url(url)
@@ -113,6 +114,9 @@ class Storage:
 
     def readback(self, vid, expected_size, check=lambda: None, output=None, *, metrics=None,
                  bucket=VIDEOS, path=None):
+        if bucket == VIDEOS and not self.video_bucket_checked:
+            self.bucket()
+            self.video_bucket_checked = True
         began = time.monotonic()
         try:
             return self._readback(vid, expected_size, check, output, metrics, bucket,

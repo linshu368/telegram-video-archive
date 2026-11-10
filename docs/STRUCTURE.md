@@ -41,9 +41,10 @@ python topic_metadata.py --help
 | `pipeline/db.py` | 数据库访问、事务函数和任务租约 |
 | `pipeline/storage.py` | 对象存储、分块上传与远端读回验证 |
 | `pipeline/ai.py` | 抽帧、模型调用、提示词和用量记录 |
-| `pipeline/transcode.py` | 现有转码处理 |
+| `pipeline/stream.py` | 私有 TUS 上传、恢复对账、转码状态和 AI 云端输入 |
+| `pipeline/transcode.py` | 手动处理旧 Supabase 对象的 faststart 待办 |
 
-默认 `run` 流程是：**完整源元数据扫描 → 按来源/话题过滤已处理池 → 整剧画质筛选 → 按剧下载补齐、上传验收 → 合格剧 AI 生成并事务回写 → 处理已有 faststart 待办 → 适用阶段完成后封存**。扫描不下载媒体；`--skip-scan` 显式复用已有有效完整扫描。AI 之后只处理现存 faststart 待办，不为没有转码任务的新视频新增转换任务。画质筛选保留合格剧的全部成员，少量低质异常只影响评分。
+默认 `run` 流程是：**完整源元数据扫描 → 按来源/话题过滤已处理池 → 整剧画质筛选 → 按剧下载补齐、上传验收 → 合格剧 AI 生成并事务回写 → 适用阶段完成后封存**。扫描不下载媒体；`--skip-scan` 显式复用已有有效完整扫描。新视频上传到 Stream 后等待全部清晰度就绪，AI 与整剧封存才可继续。画质筛选保留合格剧的全部成员，少量低质异常只影响评分。
 
 ```sh
 python pipeline.py run --drama-concurrency 2 --concurrency 4
@@ -53,7 +54,7 @@ python pipeline.py run --drama-concurrency 2 --concurrency 4
 
 默认初次处理后最多做 4 轮补齐，数据库累计最多 5 次尝试的限制仍有效。租约、次数上限或硬性大小约束不能通过重置状态绕过；失败原因和每次重试历史保留。最终以完整源清单为分母：全部视频已验证提交为 `complete`，尚未验证的唯一视频比例严格小于 10% 为 `accepted_with_gaps`，否则拒绝。硬停止或中断为 `pending`。下载缺失率与画质评分的 10% 异常预算分别计算。
 
-`--only/--first` 扩展到整剧；`--limit` 是视频数量软目标，当前剧完整纳入后才停止接新剧；`--drama-limit N` 直接限制本次剧数。视频验证指下载验证、上传读回且云端提交完成，不要求所有集同时占据本地缓存。封面完成另行记录，缺失率按预期视频计算。
+`--only/--first` 扩展到整剧；`--limit` 是视频数量软目标，当前剧完整纳入后才停止接新剧；`--drama-limit N` 直接限制本次剧数。视频验证要求下载验证及云端提交。旧视频使用对象读回收据，新视频使用 Stream 就绪收据，不要求所有集同时占据本地缓存。封面完成另行记录，缺失率按预期视频计算。
 
 `repair` 根据源完整清单和已验证云提交重算缺口，无需旧 report；已齐的旧数据只做审计，无需重新下载，缺失成员和 partial 才进入补齐。
 
@@ -116,7 +117,7 @@ python scripts/validation/validate_implementation.py
 
 拒绝或 `pending` 的剧不进入后续 AI 或转码，已上传的云端对象不会因此被主动删除。`ai` 和 `transcode-backlog` 继续作为分阶段入口，只处理通过下载验收且与当前完整清单一致的剧；从未评定的旧数据先运行 `repair` 审计。
 
-已处理池记录 `screening_rejected`、`download_rejected`、`completed`。`completed` 要求下载验收通过、AI 事务提交、已下载视频封面完成或无缩略图，以及实际存在的后处理任务全部完成；没有转码任务按不适用处理。临时失败和待完成阶段不入池，下次按进度继续；成功 AI 任务不会因重复运行或解除跳过而再次付费生成。
+已处理池记录 `screening_rejected`、`download_rejected`、`completed`。`completed` 要求下载验收通过、AI 事务提交、已下载视频封面完成或无缩略图，以及已交付 Stream 视频转码就绪。临时失败和待完成阶段不入池，下次按进度继续；成功 AI 任务不会因重复运行或解除跳过而再次付费生成。
 
 ```sh
 python pipeline.py processed

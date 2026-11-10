@@ -7,6 +7,7 @@ import re
 import shutil
 import sqlite3
 import subprocess
+import unicodedata
 from collections import Counter
 from datetime import datetime, timezone
 from pathlib import Path
@@ -118,13 +119,58 @@ def pick_thumb(doc):
     return max(candidates, key=lambda t: ((t['width'] or 0) * (t['height'] or 0), t['size'] or 0))
 
 
+# Match an episode designation in a caption, independently of drama identity.
+_EP_NUMBER = r'(?:[0-9]{1,6}|[零〇一二两兩三四五六七八九十百千]{1,12})'
+_EP_MARKER = re.compile(
+    rf'(?<![a-z0-9])ep(?:isode)?[ ._:#-]*({_EP_NUMBER})(?![a-z0-9])'
+    rf'|(?<![0-9零〇一二两兩三四五六七八九十百千.])(?:第[ \t]*)?({_EP_NUMBER})[ \t]*集(?![锦錦合数數])',
+    re.I)
+_EP_RANGE = re.compile(
+    rf'(?:第|ep)?\s*{_EP_NUMBER}\s*(?:集\s*)?(?:[-~～—–至到、])\s*(?:第|ep)?\s*{_EP_NUMBER}\s*集'
+    rf'|(?<![a-z0-9])ep\s*{_EP_NUMBER}\s*[-~～—–至到]\s*(?:ep\s*)?{_EP_NUMBER}', re.I)
+_EP_TOTAL = re.compile(r'(?:共计?|总计?|全|更新至|更新到|分为)\s*$')
+_CN_DIGITS = dict(zip('零一二三四五六七八九', range(10)), 〇=0, 两=2, 兩=2)
+
+
+def _episode_number(token):
+    if token.isascii():
+        return str(int(token))
+    if all(c in _CN_DIGITS for c in token):
+        return str(int(''.join(str(_CN_DIGITS[c]) for c in token)))
+    total, digit, last_unit = 0, None, 10000
+    for char in token:
+        if char in _CN_DIGITS:
+            if digit:
+                return ''
+            digit = _CN_DIGITS[char]
+        else:
+            unit = {'十': 10, '百': 100, '千': 1000}[char]
+            if unit >= last_unit or digit is None and (total or unit != 10):
+                return ''
+            total += (1 if digit is None else digit) * unit
+            digit, last_unit = None, unit
+    return str(total + (digit or 0))
+
+
+def caption_episode(text):
+    caption = unicodedata.normalize('NFKC', text)
+    if _EP_RANGE.search(caption):
+        return ''
+    numbers = set()
+    for match in _EP_MARKER.finditer(caption):
+        if _EP_TOTAL.search(caption[:match.start()]) or re.match(r'\s*(?:全|合集)', caption[match.end():]):
+            continue
+        numbers.add(_episode_number(match.group(1) or match.group(2)))
+    return numbers.pop() if len(numbers) == 1 else ''
+
+
 def extract_text(text):
-    # Only explicitly labelled values. Never infer a drama identity from a caption.
+    # Titles and descriptions require labels. Episode markers never determine drama identity.
     def labelled(label):
         m = re.search(rf'(?m)^[ \t]*(?:{label})[ \t]*[:：][ \t]*([^\r\n]+?)[ \t]*$', text)
         return m.group(1) if m else ''
     return {'title': labelled('标题|剧名'), 'description': labelled('简介'),
-            'episode': labelled('集数'),
+            'episode': labelled('集数') or caption_episode(text),
             'tags': list(dict.fromkeys(re.findall(r'(?<!\w)#([\w]+)', text)))}
 
 

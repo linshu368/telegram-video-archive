@@ -1,6 +1,6 @@
 # Telegram 短剧处理
 
-从已确认的 Telegram 来源收集完整视频信息，按整部剧筛选、下载补齐与验收，再为合格剧生成 AI 信息并写回数据库，完成实际存在的后处理任务后封存。代码按用途分组，剧内共享全局视频并发；视频下载、校验、上传和缓存清理沿用现有内核。
+从已确认的 Telegram 来源收集完整视频信息，按整部剧筛选、下载补齐与验收，新视频经 Cloudflare Stream 私有上传、转码就绪后，为合格剧生成 AI 信息并写回 Supabase。
 
 ## 从哪里开始
 
@@ -16,13 +16,13 @@
 
 ## 当前流程：一个 `run` 完成全链路
 
-以下命令均从仓库根目录执行，并使用已安装依赖的 Python 环境。完成既有 Telegram 登录、来源白名单及数据库、存储、AI 配置后执行：
+以下命令均从仓库根目录执行，并使用已安装依赖的 Python 环境。完成既有 Telegram 登录、来源白名单及数据库、存储、Stream、AI 配置后执行：
 
 ```sh
 python pipeline.py run --drama-concurrency 2 --concurrency 4
 ```
 
-默认依次进行：**完整源元数据扫描 → 整剧画质筛选 → 按剧下载补齐、上传验收 → 合格剧 AI 生成并事务回写 → 处理已有 faststart 待办 → 适用阶段完成后封存**。源扫描只读取信息，不下载视频或封面。faststart 仅处理已有待办；新视频没有转码任务时算不适用，不会新增转换任务。需要复用已有有效完整扫描时，显式使用 `run --skip-scan`。
+默认依次进行：**完整源元数据扫描 → 整剧画质筛选 → 按剧下载补齐 → 私有上传与转码就绪验收 → 合格剧 AI 生成并事务回写 → 封面验收与封存**。源扫描只读取信息，不下载视频或封面。已有 Supabase 视频继续使用原对象。Stream 配置、迁移顺序及 App 字段见[流程与操作](docs/PIPELINE.md#cloudflare-stream)。需要复用已有有效完整扫描时，显式使用 `run --skip-scan`。
 
 一部剧以 Telegram 原始话题在扫描边界内可访问的全部视频为准。信息不完整的剧暂缓；包含横屏或方屏的剧排除；其余按既定分辨率和码率标准判断。合格剧的成员完整保留，少量画质异常只影响评分。具体规则见 [整剧筛选说明](docs/PIPELINE.md)。
 
@@ -51,7 +51,7 @@ python pipeline.py repair
 
 ## 已处理池：避免重复判断和重复付费
 
-当前项目的持久池位于 `archive/pipeline/projects/<project_ref>/processed-dramas.json`。明确画质拒绝（`screening_rejected`）、下载最终拒绝（`download_rejected`）、全阶段完成（`completed`）三类结果入池；临时断网、信息不足、预算或大小限制暂缓、AI 失败、封面或封装待完成不入池，下次沿已有进度继续。已提交成功的 AI 任务会复用，不重复生成。`completed` 要求下载验收、AI 提交、封面完成或无缩略图，以及实际存在的后处理任务全部完成；没有转码任务不会一直待定。
+当前项目的持久池位于 `archive/pipeline/projects/<project_ref>/processed-dramas.json`。明确画质拒绝（`screening_rejected`）、下载最终拒绝（`download_rejected`）、全阶段完成（`completed`）三类结果入池；临时断网、信息不足、预算或大小限制暂缓、AI 失败、封面或 Stream 转码待完成不入池，下次沿已有进度继续。已提交成功的 AI 任务会复用，不重复生成。`completed` 要求下载验收、AI 提交、封面完成或无缩略图，以及新视频的 Stream 就绪收据。
 
 查看处理池或手动解除跳过：
 

@@ -4,7 +4,7 @@ import fcntl
 from contextlib import contextmanager, nullcontext
 
 from video_archive.core import Store, atomic_json, now
-from video_archive.pipeline.common import PipelineError, ai_output, error_code
+from video_archive.pipeline.common import PipelineError, ai_output, error_code, is_stream
 
 
 @contextmanager
@@ -77,6 +77,20 @@ def ai_committed(cloud, did, allowed_sources=None):
     return True
 
 
+def encoding_outstanding(db, members, committed):
+    for _, video, record, _ in members:
+        if record['message_id'] in committed:
+            continue
+        state = db.state(video['id'])
+        if is_stream(state):
+            upload = state['tasks']['upload']
+            process = state['tasks']['stream_process']
+            if (upload.get('stream_create_started') or upload['status'] == 'succeeded') and not (
+                    process['status'] == 'failed' and process.get('last_error') == 'stream_encoding_failed'):
+                return True
+    return False
+
+
 def process_ai(db, storage, cache, rows, *, analyze, provider=None, limit=None, report_path=None):
     """Reuse the existing drama AI transaction; resume after success without paying twice."""
     from video_archive.pipeline.batch import select_ai_drama_candidates
@@ -100,6 +114,8 @@ def process_ai(db, storage, cache, rows, *, analyze, provider=None, limit=None, 
                                if job[2]['message_id'] in committed}
             sample = next(job for job in groups[did] if job[2]['message_id'] in committed)
             try:
+                if encoding_outstanding(db, groups[did], committed):
+                    raise PipelineError('stream_processing')
                 cloud = db.state(sample[1]['id'])
                 verify_identity(sample[1], sample[2], cloud)
                 if ai_committed(cloud, did, allowed_sources):
@@ -115,11 +131,11 @@ def process_ai(db, storage, cache, rows, *, analyze, provider=None, limit=None, 
                         raise PipelineError('ai_commit_not_verified')
                     entry['result'] = 'ai_succeeded'
             except PipelineError as exc:
-                entry.update(result='pending' if str(exc) == 'task_not_claimable' else 'failed',
+                entry.update(result='pending' if str(exc) in ('task_not_claimable', 'stream_processing') else 'failed',
                              error=error_code(exc))
             except Exception as exc:
                 entry.update(result='failed', error=error_code(exc))
-            if entry['result'] in ('pending', 'failed'):
+            if entry['result'] in ('pending', 'failed') and entry.get('error') != 'stream_processing':
                 # A response can be lost after the transaction has already committed.
                 try:
                     cloud = db.state(sample[1]['id'])
@@ -142,7 +158,7 @@ def process_ai(db, storage, cache, rows, *, analyze, provider=None, limit=None, 
 
 
 def finalize_processed(db, rows, *, path, project_ref, report_path=None):
-    """Seal only dramas whose accepted videos, covers, AI and faststart are committed."""
+    """Seal only dramas whose accepted videos, covers, and AI are committed."""
     from video_archive.pipeline.processed import record_success
     from video_archive.pipeline.runner import committed_inventory
     rows = list(rows)
@@ -152,7 +168,9 @@ def finalize_processed(db, rows, *, path, project_ref, report_path=None):
         entry = {'drama_id': did, 'result': 'pending'}
         try:
             available = [job for job in members if job[2]['message_id'] in committed]
-            if not available:
+            if encoding_outstanding(db, members, committed):
+                entry['reason'] = 'stream_processing'
+            elif not available:
                 entry['reason'] = 'no_committed_video'
             else:
                 states = [db.state(job[1]['id']) for job in available]
@@ -164,16 +182,12 @@ def finalize_processed(db, rows, *, path, project_ref, report_path=None):
                     entry['reason'] = 'ai_pending'
                 elif any(job[2]['message_id'] not in covered for job in available):
                     entry['reason'] = 'cover_pending'
-                elif not all('transcode' not in state.get('tasks', {})
-                             or (state['tasks']['transcode'] or {}).get('status') == 'succeeded'
-                             for state in states):
-                    entry['reason'] = 'transcode_pending'
                 else:
                     record_success(path, project_ref, members, report_path=report_path,
                                    details={'verified_video_count': len(available),
                                             'missing_video_count': len(members) - len(available),
                                             'delivery_accepted': True, 'ai_complete': True,
-                                            'transcode_complete': True, 'cover_complete': True})
+                                            'stream_ready_complete': True, 'cover_complete': True})
                     entry['result'] = 'completed'
         except Exception as exc:
             entry['reason'] = error_code(exc)

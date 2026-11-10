@@ -123,6 +123,7 @@ class CliPathTests(unittest.TestCase):
         args = ['pipeline.py', '--config', '.private/settings.json', 'check']
         with (working_directory(self.root), patch.object(sys, 'argv', args),
               patch.object(runner, 'config', wraps=runner.config) as load_config,
+              patch.object(runner, 'stream_config'),
               patch.object(runner, 'Database') as database,
               patch.object(runner, 'Storage') as storage, redirect_stdout(io.StringIO())):
             database.return_value.verify_worker.return_value = {}

@@ -9,8 +9,8 @@ from video_archive.pipeline.completion import manifest_digest, manifest_for_jobs
 
 
 TERMINAL_STATUSES = {'screening_rejected', 'download_rejected', 'completed'}
-COMPLETION_FLAGS = ('delivery_accepted', 'ai_complete', 'transcode_complete', 'cover_complete')
-DETAIL_FIELDS = (*COMPLETION_FLAGS, 'delivery_decision', 'delivery_finalized', 'expected_count',
+COMPLETION_FLAGS = ('delivery_accepted', 'ai_complete', 'cover_complete')
+DETAIL_FIELDS = (*COMPLETION_FLAGS, 'stream_ready_complete', 'transcode_complete', 'delivery_decision', 'delivery_finalized', 'expected_count',
                  'verified_video_count', 'missing_video_count', 'missing_video_ratio',
                  'planning_status', 'planning_reason', 'grade', 'grade_label', 'method')
 
@@ -200,13 +200,16 @@ def record_evaluations(path, project_ref, evaluations, report_path=None):
 
 
 def _success_confirmed(details):
-    return isinstance(details, dict) and all(details.get(key) is True for key in COMPLETION_FLAGS)
+    if not isinstance(details, dict) or not all(details.get(key) is True for key in COMPLETION_FLAGS):
+        return False
+    # Earlier pool entries recorded completion of the legacy remux stage.
+    return details.get('stream_ready_complete', details.get('transcode_complete')) is True
 
 
 def record_success(path, project_ref, rows, *, report_path=None, details=None):
     """Seal one complete source drama after the caller verifies every final stage.
 
-    Delivery acceptance alone is insufficient. AI, transcode and cover completion
+    Delivery acceptance alone is insufficient. AI, encoding and cover completion
     must each be explicitly confirmed by the caller; pending stages stay reusable.
     """
     data = load_pool(path, project_ref)

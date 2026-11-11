@@ -73,6 +73,7 @@ class SourceSnapshotTests(unittest.TestCase):
             self.assertEqual([r[2]['message_id'] for r in rows], [11, 12])
             self.assertEqual(excluded, {'outside_source_topic_inventory': 1})
             self.assertEqual(rows[0][1]['bitrate_bps'], 3_200_000)
+            self.assertEqual(rows[0][1]['duration_seconds'], 20.0)
             self.assertEqual(rows[0][0]['title'], 'source drama')
 
     def test_cached_caption_populates_episode_in_import_payload(self):
@@ -117,6 +118,12 @@ class SourceSnapshotTests(unittest.TestCase):
 
 
 class DramaCliTests(unittest.TestCase):
+    def setUp(self):
+        # Never read the real .private/ai.json: text structuring would call the paid API.
+        patcher = patch('video_archive.pipeline.runner.ai_config', return_value=None)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
     def call_plan(self, root, *extra):
         args = ['pipeline.py', '--data', str(root), 'plan', *extra]
         output = io.StringIO()

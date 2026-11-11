@@ -34,6 +34,14 @@ def tags(value):
     return list(dict.fromkeys(x.strip() for x in (value or []) if isinstance(x, str) and x.strip()))
 
 
+def duration_seconds(record):
+    """Measured source duration (Telegram media attribute); never asked of a model, which only sees captions."""
+    value = record.get('duration_seconds')
+    if isinstance(value, bool) or not isinstance(value, (int, float)) or not 0 < value < 10_000_000:
+        return None
+    return round(float(value), 3)
+
+
 def ai_output(value):
     if not isinstance(value, dict) or set(value) != {'title', 'tags', 'description'}:
         raise PipelineError('invalid_ai_output')
@@ -308,7 +316,7 @@ def snapshot(root, topics_path, *, require_complete=False):
                  'media_id': str(r['media_id']), 'original_title': text(r.get('title')),
                  'original_tags': tags(r.get('tags')), 'original_description': text(r.get('description')),
                  'episode': text(r.get('episode')) or text(caption_episode(r.get('text') or '')),
-                 **media_metadata(r, s)}
+                 'duration_seconds': duration_seconds(r), **media_metadata(r, s)}
             result.append((d, v, r, s))
         if source_members is not None and seen_members != set(source_members):
             raise PipelineError('source_topic_inventory_records_missing')

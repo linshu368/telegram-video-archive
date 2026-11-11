@@ -12,6 +12,8 @@
 
 **存量重传（010）**。已有的 supabase 视频没有经过画质筛选，按"不存在"处理：`archived_messages()` 只认 Stream 已就绪的行，存量行因此重新走筛选，通过的剧在 `batch` 里经 `begin_restream` 重置 download/upload 并重新下载、上传到 Stream。重传期间该行仍是 `supabase` 加 `object_path`，App 照常播放旧文件；`video_state` 把它按 Stream 行汇报，worker 不需要额外分支。同一部剧的最后一集 `stream_process` 就绪时，在同一个事务里把整部剧所有行切成 `cloudflare_stream`（写 `stream_uid`、`stream_ready_at`，`object_path` 置空），App 永远看不到半切换的剧。没通过筛选的剧不进入重传，存量行原样保留。旧文件不删除，路径恒为 `videos/<id>/original`，单行回滚的 SQL 见迁移头部注释。`legacy_messages()` 返回仍在 Supabase 的存量消息，文字结构化据此全部跳过。应用顺序：009 → 010，且 App 已支持按 `stream_uid` 播放之后再开始重传。`verify_worker` 容忍 App 自有的 `drama_comments`、`drama_likes`、`create_drama_comment`，但要求 worker 对它们没有任何权限。
 
+**媒体元数据（011）**。`videos.duration_seconds`（秒，Telegram 实测值，不由模型生成）以及 `width`、`height`、`bitrate_bps` 现在由 `import_video` 在入库时写入；已有行只补空值、不覆盖，非法值按 NULL 处理，不会让入库失败。011 在 010 之后由库 owner 应用一次；既有行的 `duration_seconds` 需从源清单回填。
+
 **配置**。按 `config/examples/cloudflare.example.json` 准备 `.private/cloudflare.json`，填入开通 Stream 的账户 ID 和对该账户具备 Stream 读写权限的 API token。私有目录权限为 0700，文件为 0600。此文件只用于归档 API；App 的播放签名私钥由消费端后端保管。Telegram 封面仍使用原 Supabase 封面桶。
 
 **验收**。上传完成后，`pipeline_tasks` 的 `upload` 行保存临时 UID、已校验原片的字节数与 SHA-256。此时 `videos.stream_uid` 仍为空。`stream_process` 核对远端 UID、项目、内部视频身份和私有标记；当 `status.state=ready`、`readyToStream=true`、`status.pctComplete=100` 同时成立，事务写入 `videos.stream_uid`、`stream_ready_at` 并完成任务。报告中的 `stream_processing` 是待完成，即使只剩一集也不能当作最终缺集。每次领取最多轮询约五分钟，正常等待不消耗失败次数。后续补齐轮次或再次运行 `run`、`repair` 会继续查询同一 UID。只有 `stream_ready` 后，`--cleanup` 才可清理已验证的本地原片。AI 优先读取原片；已清理时，归档 worker 为 AI 临时获取私有 Stream 输入，用于抽帧和转录。

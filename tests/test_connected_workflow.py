@@ -18,6 +18,10 @@ from test_download_repair import committed
 
 class ConnectedWorkflowTests(unittest.TestCase):
     def setUp(self):
+        # Never read the real .private/ai.json: text structuring would call the paid API.
+        patcher = patch('video_archive.pipeline.runner.ai_config', return_value=None)
+        patcher.start()
+        self.addCleanup(patcher.stop)
         self.temp = tempfile.TemporaryDirectory()
         self.root = Path(self.temp.name)
         self.config = {'project_ref': 'testref', 'database_dsn': 'unused',

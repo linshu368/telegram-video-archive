@@ -575,6 +575,10 @@ class PostgresTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
         import psycopg
+        # Never read the real .private/cloudflare.json: a configured Stream would receive test uploads.
+        cls.no_stream_config = patch('video_archive.pipeline.stream.stream_config',
+                                     side_effect=PipelineError('private_stream_config_missing'))
+        cls.no_stream_config.start()
         cls.dsn = os.environ['DRAMA_TEST_DSN']
         # Explicit test DB only. Never accept a Supabase or production database.
         from psycopg.conninfo import conninfo_to_dict
@@ -610,6 +614,7 @@ class PostgresTests(unittest.TestCase):
         if legacy['storage_provider'] != 'supabase' or 'stream_process' in legacy['tasks']:
             raise AssertionError('migration changed an existing video')
         cls.owner.execute((BASE / 'migrations/010_restream_legacy.sql').read_text())
+        cls.owner.execute((BASE / 'migrations/011_video_media_metadata.sql').read_text())
         cls.db = Database(cls.dsn + " options='-c role=drama_worker'")
         cls.login = 'drama_test_' + uuid.uuid4().hex[:12]
         cls.owner.execute(psycopg.sql.SQL('CREATE ROLE {} LOGIN NOSUPERUSER NOBYPASSRLS').format(
@@ -621,6 +626,7 @@ class PostgresTests(unittest.TestCase):
     @classmethod
     def tearDownClass(cls):
         import psycopg
+        cls.no_stream_config.stop()
         cls.owner.execute(psycopg.sql.SQL('DROP OWNED BY {}').format(psycopg.sql.Identifier(cls.login)))
         cls.owner.execute(psycopg.sql.SQL('DROP ROLE {}').format(psycopg.sql.Identifier(cls.login)))
         cls.owner.close()
@@ -1125,11 +1131,47 @@ class PostgresTests(unittest.TestCase):
         with patch('psycopg.connect', Mock(side_effect=psycopg.OperationalError('refused'))) as always, \
                 patch('time.sleep'), self.assertRaises(psycopg.OperationalError):
             Database('x').connect()
-        self.assertEqual(always.call_count, 4)
+        self.assertEqual(always.call_count, 8)  # Database.connect() retries 8 times (~75s window)
         import re
         code = error_code(psycopg.OperationalError('password=secret'))
         self.assertEqual(code, 'psycopg_OperationalError')
         self.assertRegex(code, r'^[A-Za-z0-9_]{1,80}$')  # matches the last_error CHECK
+
+    def media_video(self, **overrides):
+        d, v = fixture(7001)
+        return d, {**v, 'width': 720, 'height': 1280, 'bitrate_bps': 2_500_000, 'duration_seconds': 54.474,
+                   **overrides}
+
+    def media_row(self, v):
+        row = self.owner.execute('SELECT width,height,bitrate_bps,duration_seconds FROM drama_archive.videos '
+                                 'WHERE id=%s', (v['id'],)).fetchone()
+        return (*row[:3], None if row[3] is None else float(row[3]))
+
+    def test_import_video_stores_media_metadata(self):
+        d, v = self.media_video()
+        self.db.call('import_video', d, v)
+        self.assertEqual(self.media_row(v), (720, 1280, 2_500_000, 54.474))
+
+    def test_import_video_media_metadata_is_fill_only(self):
+        d, v = self.media_video()
+        blank = {**v, 'width': None, 'height': None, 'bitrate_bps': None, 'duration_seconds': None}
+        self.db.call('import_video', d, blank)
+        self.assertEqual(self.media_row(v), (None, None, None, None))
+        self.db.call('import_video', d, v)  # a later import fills the NULLs
+        self.assertEqual(self.media_row(v), (720, 1280, 2_500_000, 54.474))
+        self.db.call('import_video', d, {**v, 'width': 1, 'height': 2, 'bitrate_bps': 3, 'duration_seconds': 4})
+        self.assertEqual(self.media_row(v), (720, 1280, 2_500_000, 54.474))  # never overwritten
+
+    def test_import_video_ignores_malformed_media_values_instead_of_failing(self):
+        for bad in ({'width': 720, 'height': None}, {'width': -1, 'height': 5}, {'bitrate_bps': -5},
+                    {'bitrate_bps': 'fast'}, {'duration_seconds': 0}, {'duration_seconds': -3},
+                    {'duration_seconds': 'abc'}, {'duration_seconds': 1e12}):
+            d, v = self.media_video(**{'width': None, 'height': None, 'bitrate_bps': None,
+                                       'duration_seconds': None, **bad})
+            self.db.call('import_video', d, v)  # a CHECK violation here would stop the whole drama
+            self.assertEqual(self.media_row(v), (None, None, None, None), bad)
+            self.owner.execute('DELETE FROM drama_archive.pipeline_tasks WHERE video_id=%s', (v['id'],))
+            self.owner.execute('DELETE FROM drama_archive.videos WHERE id=%s', (v['id'],))
 
     def test_archived_messages_function_is_restricted_and_reports_commits(self):
         self.assertEqual(self.db.archived_messages(), set())

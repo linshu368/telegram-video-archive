@@ -81,6 +81,12 @@ class ReceiptTests(unittest.TestCase):
 
 
 class RepairCliTests(unittest.TestCase):
+    def setUp(self):
+        # Never read the real .private/ai.json: text structuring would call the paid API.
+        patcher = patch('video_archive.pipeline.runner.ai_config', return_value=None)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
     def test_repair_needs_no_old_report_and_only_schedules_the_missing_member(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)

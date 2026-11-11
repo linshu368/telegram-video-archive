@@ -125,7 +125,11 @@ class SchedulingTests(unittest.TestCase):
         self.assertEqual(claim_blocker(cloud), 'lease_active')
         task['lease_expires_at'] = (now-timedelta(seconds=1)).isoformat()
         self.assertIsNone(claim_blocker(cloud))
-        task['attempts'] = 5
+        from video_archive.pipeline.common import MAX_TASK_ATTEMPTS
+        self.assertEqual(MAX_TASK_ATTEMPTS, 8)
+        task['attempts'] = MAX_TASK_ATTEMPTS - 1  # still claimable: flaky links may need more than 5 tries
+        self.assertIsNone(claim_blocker(cloud))
+        task['attempts'] = MAX_TASK_ATTEMPTS
         self.assertEqual(claim_blocker(cloud), 'attempts_exhausted')
 
     def test_partial_resume_appends_working_copy_preserving_original(self):

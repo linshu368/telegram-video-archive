@@ -112,7 +112,7 @@ python pipeline.py run --drama-concurrency 2 --concurrency 4
 
 ### 有界补齐与最终缺失率
 
-每个剧通道先做本轮初次处理，再默认最多补齐 4 轮。数据库累计最多 5 次尝试、有效租约和退避继续生效；遇到租约占用、次数耗尽或硬性大小约束，记录原因，不强行重置。单集失败和每次补齐历史都保留。
+每个剧通道先做本轮初次处理，再默认最多补齐 4 轮。数据库累计最多 8 次尝试（`MAX_TASK_ATTEMPTS`）、有效租约和退避继续生效；遇到租约占用、次数耗尽或硬性大小约束，记录原因，不强行重置。单集失败和每次补齐历史都保留。
 
 最终缺失率按完整源清单计算，按唯一视频身份去重：
 
@@ -202,7 +202,7 @@ python pipeline.py --config .private/main-pipeline.json run --batch-size 100 --c
 - 新 `batch` 明确限制最多 100 个；新 `run` 在同一进程、同一项目锁和 Telegram 连接下分段处理有限清单，不是常驻服务。当前仅授权 test 的六条验收，main 全量仍需明确确认。
 - 缓存按目标 `project_ref` 分目录保存在 `/Users/qj/python_project/telegram-video-archive/archive/pipeline/projects/{project_ref}/`。旧 `/Users/qj/python_project/telegram-video-archive/archive/pipeline/cache.sqlite3` 原样保留；其 tombstone 和上传会话不用于新项目。流水线每次以目标数据库为准；同一份本地原件可以复用。
 - 默认只选不超过 128 MiB 的视频。更大的文件、3021、已有 `.part` 单独列为 deferred，不能将正常队列完成写成 5,212 个全部完成。阈值可显式调整，且任何超过目标桶实际限制的文件都不会进入下载。
-- 每次运行每视频至多一次媒体传输，单文件默认超时 1800 秒，可用 `--download-timeout` 改为 30..86400 秒；跨次运行仍受数据库最多五次领取和退避限制。失败不在本轮反复重试；后续分段继续。已有部分文件不删除、不自动从头重下，等待单独恢复。
+- 每次运行每视频至多一次媒体传输，单文件默认超时 1800 秒，可用 `--download-timeout` 改为 30..86400 秒；跨次运行仍受数据库最多八次领取（`MAX_TASK_ATTEMPTS`）和退避限制。失败不在本轮反复重试；后续分段继续。已有部分文件不删除、不自动从头重下，等待单独恢复。
 - 长时间 FloodWait、缓存持续不足或数据库连接重试耗尽停止后续领取；短 FloodWait 对新下载统一等待并降低并发。SIGTERM 协作停止，并等待上传线程结束后才释放项目锁。
 - 报告每 15 秒刷新，含 Telegram 传输、下载/上传前校验、TUS PATCH 和完整远端读回耗时及字节数。`run` 同时保留每段独立报告，重启以目标库已提交对象为准。
 - main 准备时由用户把全局、私有桶及本机配置的单文件限制统一为 5 GB；目前不自动修改已有桶。最大清单文件 4,033,019,179 字节。
@@ -309,7 +309,7 @@ python pipeline.py import
 python pipeline.py samples
 ```
 
-启动会取得现有 `/Users/qj/python_project/telegram-video-archive/.private/process.lock`，与原下载互斥。Ctrl-C 或向该进程发送 SIGTERM 停止；再次执行同一个 `samples` 命令恢复。失败任务默认退避 30 秒、最多 5 次领取、租约 120 秒，每 40 秒续租；SIGKILL 后等待租约过期。耗尽重试后不自动无限循环，由管理员检查原因后受控重置任务（不要删除视频重建 UUID）。不启动任何批量常驻 worker。
+启动会取得现有 `/Users/qj/python_project/telegram-video-archive/.private/process.lock`，与原下载互斥。Ctrl-C 或向该进程发送 SIGTERM 停止；再次执行同一个 `samples` 命令恢复。失败任务默认退避 30 秒、最多 8 次领取、租约 120 秒，每 40 秒续租；SIGKILL 后等待租约过期。耗尽重试后不自动无限循环，由管理员检查原因后受控重置任务（不要删除视频重建 UUID）。不启动任何批量常驻 worker。
 
 稳定 UUIDv5 由来源 ID 与话题/消息 ID 派生；媒体 ID 不允许变更，跨来源复合 FK 防错配。消息原文不会导入云端。导入冲突事务回滚，不更新原字段掩盖变化。
 

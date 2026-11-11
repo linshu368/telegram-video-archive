@@ -11,6 +11,9 @@ from pathlib import Path
 from video_archive.core import caption_episode
 from video_archive.paths import BASE
 NAMESPACE = uuid.UUID('795ec7d2-3505-4cef-9f46-8aad88c7028b')
+# Database-side claim() refuses a task once it has been claimed this many times; the scheduler's own
+# "exhausted" checks must use the same number. Raised from 5 for flaky connections (TLS drops).
+MAX_TASK_ATTEMPTS = 8
 
 
 class PipelineError(Exception):

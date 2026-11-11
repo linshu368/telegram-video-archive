@@ -14,8 +14,8 @@ from video_archive.core import StopArchive, atomic_json, filename, now
 from video_archive.pipeline.runner import (archive_existing, cover_download_task, cover_upload_task,
                       download_task, process_stream, sample_evidence, transcode_task)
 from video_archive.pipeline.stream import stream_config
-from video_archive.pipeline.common import (PipelineError, error_code, is_stream, mark_cover_remote, parse_timestamp,
-                                           video_committed)
+from video_archive.pipeline.common import (MAX_TASK_ATTEMPTS, PipelineError, error_code, is_stream, mark_cover_remote,
+                                           parse_timestamp, video_committed)
 from video_archive.pipeline.completion import (check_result_identity, check_segment, drama_progress,
                                                 manifest_digest, manifest_for_jobs, manifest_map,
                                                 read_pass_report, recover_active_segment,
@@ -228,9 +228,9 @@ def claim_blocker(cloud):
     task = tasks['upload'] if tasks['download']['status'] == 'succeeded' else tasks['download']
     if is_stream(cloud) and tasks['upload']['status'] == 'succeeded':
         task = tasks['stream_process']
-        if task.get('attempts', 0) >= 5 and task.get('last_error') != 'stream_encoding_failed':
+        if task.get('attempts', 0) >= MAX_TASK_ATTEMPTS and task.get('last_error') != 'stream_encoding_failed':
             return 'stream_status_unconfirmed'
-    if task.get('attempts', 0) >= 5:
+    if task.get('attempts', 0) >= MAX_TASK_ATTEMPTS:
         if is_stream(cloud) and task.get('stream_create_started'):
             return 'stream_status_unconfirmed'
         return 'attempts_exhausted'

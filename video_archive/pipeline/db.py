@@ -6,7 +6,7 @@ import time
 import psycopg
 from psycopg.types.json import Jsonb
 
-from video_archive.pipeline.common import PipelineError, error_code
+from video_archive.pipeline.common import MAX_TASK_ATTEMPTS, PipelineError, error_code
 
 
 WORKER_FUNCTIONS = frozenset({
@@ -125,7 +125,7 @@ class Database:
     def state(self, vid):
         return self.call('video_state', vid)
 
-    def claim(self, vid, stage, seconds=120, attempts=5, backoff=30):
+    def claim(self, vid, stage, seconds=120, attempts=MAX_TASK_ATTEMPTS, backoff=30):
         return self.call('claim', vid, stage, seconds, attempts, backoff)
 
 

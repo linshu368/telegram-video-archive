@@ -257,6 +257,31 @@ class DramaCliTests(unittest.TestCase):
             decision = runner.call_args.kwargs['drama_evaluations'][0]
             self.assertEqual(decision['scheduled_message_ids'], [11, 12])
 
+    def test_text_structuring_skips_archived_and_legacy_supabase_videos(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp); source_inventory(root)
+            db, storage = MagicMock(), MagicMock()
+            db.archived_messages.return_value = set()
+            db.legacy_messages.return_value = {11}
+            storage.limit = 128 * 1024**2
+            config = {'database_dsn': 'unused', 'project_ref': 'testref',
+                      'global_file_limit': 128 * 1024**2, 'bucket_file_limit': 128 * 1024**2}
+            runner = AsyncMock(return_value={'status': 'all_archived', 'videos': []})
+            structure = MagicMock(return_value=[])
+            args = ['pipeline.py', '--data', str(root), 'batch', '--drama-limit', '1']
+            with (patch.object(sys, 'argv', args), patch('video_archive.pipeline.runner.BASE', root),
+                  patch('video_archive.pipeline.runner.config', return_value=config),
+                  patch('video_archive.pipeline.runner.ai_config', return_value={'model': 'x'}),
+                  patch('video_archive.pipeline.runner.Database', return_value=db),
+                  patch('video_archive.pipeline.runner.Storage', return_value=storage),
+                  patch('video_archive.pipeline.runner.Cache'),
+                  patch('video_archive.pipeline.runner.backup_legacy'),
+                  patch('video_archive.pipeline.text_structuring.structure_jobs', structure),
+                  patch('video_archive.pipeline.batch.run_batch', runner),
+                  contextlib.redirect_stdout(io.StringIO())):
+                self.assertEqual(main(), 0)
+            self.assertEqual(structure.call_args.kwargs['skip_message_ids'], {11})
+
 
 if __name__ == '__main__':
     unittest.main()

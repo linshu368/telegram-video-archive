@@ -1,6 +1,7 @@
 {
   "provider": "",
   "model": "",
+  "text_model": "",
   "api_key": "",
   "frame_count": 6,
   "max_dim": 768

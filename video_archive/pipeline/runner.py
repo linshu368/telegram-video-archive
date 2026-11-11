@@ -16,7 +16,7 @@ from pathlib import Path
 
 from video_archive.core import atomic_json, cover_filename, filename, now, sha256, validate_file
 from video_archive.pipeline.cache import Cache, legacy_entry
-from video_archive.pipeline.common import (BASE, PipelineError, ai_output, config, cover_object_path,
+from video_archive.pipeline.common import (BASE, PipelineError, ai_config, ai_output, config, cover_object_path,
                              error_code, identity, is_stream, object_path, snapshot, video_committed)
 from video_archive.pipeline.db import Database, Lease
 from video_archive.pipeline.storage import Storage
@@ -707,6 +707,20 @@ def main():
                     # Validate local AI settings before spending time transferring new media.
                     from video_archive.pipeline.ai import build_provider
                     provider = build_provider()
+                text_structuring = []
+                if jobs:
+                    from video_archive.pipeline.text_structuring import structure_cache_file, structure_jobs
+                    try:
+                        text_cfg = ai_config()
+                    except PipelineError as exc:
+                        # batch/retry/repair never needed AI settings; keep the regex fields for them.
+                        if str(exc) != 'private_ai_config_missing' or args.command == 'run':
+                            raise
+                        text_cfg = None
+                    if text_cfg:
+                        text_structuring = structure_jobs(
+                            jobs, cfg=text_cfg, cache_path=structure_cache_file(args.data, c['project_ref']),
+                            skip_message_ids=archived | db.legacy_messages())
                 backup_legacy(args.data)
                 gib = 1024 ** 3
                 cache = Cache(args.data, high=args.cache_high_gb * gib, low=args.cache_high_gb * gib * 6 // 10,
@@ -732,7 +746,7 @@ def main():
                                                    project_ref=c['project_ref'], deferred=deferred))
                 finally:
                     store.db.close()
-                report.update(quality_policy=quality_policy.to_dict(),
+                report.update(quality_policy=quality_policy.to_dict(), text_structuring=text_structuring,
                               drama_selection_report=str(selection_path),
                               processed_pool_skipped=pool_skipped)
                 record_evaluations(pool_path, c['project_ref'], report.get('dramas', evaluations),

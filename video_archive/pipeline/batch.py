@@ -14,7 +14,8 @@ from video_archive.core import StopArchive, atomic_json, filename, now
 from video_archive.pipeline.runner import (archive_existing, cover_download_task, cover_upload_task,
                       download_task, process_stream, sample_evidence, transcode_task)
 from video_archive.pipeline.stream import stream_config
-from video_archive.pipeline.common import PipelineError, error_code, is_stream, mark_cover_remote, video_committed
+from video_archive.pipeline.common import (PipelineError, error_code, is_stream, mark_cover_remote, parse_timestamp,
+                                           video_committed)
 from video_archive.pipeline.completion import (check_result_identity, check_segment, drama_progress,
                                                 manifest_digest, manifest_for_jobs, manifest_map,
                                                 read_pass_report, recover_active_segment,
@@ -235,10 +236,10 @@ def claim_blocker(cloud):
         return 'attempts_exhausted'
     current = datetime.now(timezone.utc)
     if task['status'] == 'running' and task.get('lease_expires_at'):
-        if datetime.fromisoformat(task['lease_expires_at']) > current:
+        if parse_timestamp(task['lease_expires_at']) > current:
             return 'lease_active'
     if task['status'] == 'failed' and task.get('updated_at'):
-        if (current - datetime.fromisoformat(task['updated_at'])).total_seconds() < 30:
+        if (current - parse_timestamp(task['updated_at'])).total_seconds() < 30:
             return 'database_backoff'
     return None
 

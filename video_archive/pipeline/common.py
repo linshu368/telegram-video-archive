@@ -34,6 +34,16 @@ def tags(value):
     return list(dict.fromkeys(x.strip() for x in (value or []) if isinstance(x, str) and x.strip()))
 
 
+def parse_timestamp(value):
+    """datetime.fromisoformat for timestamps coming back from PostgreSQL.
+
+    Python < 3.11 accepts only 3 or 6 fractional digits, but PostgreSQL drops trailing zeros
+    ('...15:53:55.86072+08:00'), which used to fail with ValueError and wedge the video for good.
+    """
+    value = re.sub(r'\.(\d+)', lambda m: '.' + m.group(1)[:6].ljust(6, '0'), value, count=1)
+    return datetime.fromisoformat(value[:-1] + '+00:00' if value.endswith('Z') else value)
+
+
 def duration_seconds(record):
     """Measured source duration (Telegram media attribute); never asked of a model, which only sees captions."""
     value = record.get('duration_seconds')

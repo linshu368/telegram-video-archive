@@ -96,6 +96,23 @@ class SchedulingTests(unittest.TestCase):
             selected, _, _ = retry_plan_dramas(jobs(), tmp, path, 'a'*20, quality_policy=QualityPolicy())
             self.assertEqual(len(selected), 3)
 
+    def test_postgres_timestamps_with_trimmed_fraction_do_not_wedge_a_video(self):
+        from datetime import datetime, timezone, timedelta
+        from video_archive.pipeline.common import parse_timestamp
+        # PostgreSQL drops trailing zeros: this exact value made fromisoformat raise ValueError on 3.10.
+        self.assertEqual(parse_timestamp('2026-11-11T15:53:55.86072+08:00'),
+                         datetime(2026, 11, 11, 15, 53, 55, 860720, tzinfo=timezone(timedelta(hours=8))))
+        for digits in range(0, 8):
+            fraction = ('.' + '123456789'[:digits]) if digits else ''
+            parsed = parse_timestamp(f'2026-11-11T07:53:55{fraction}+00:00')
+            self.assertEqual(parsed.microsecond, int(('123456789'[:digits] + '000000')[:6] or 0))
+        self.assertEqual(parse_timestamp('2026-11-11T07:53:55.5Z').microsecond, 500000)
+        old = datetime.now(timezone.utc) - timedelta(seconds=120)
+        for micro in (860720, 860700, 860000, 500000):
+            stamp = old.replace(microsecond=micro).isoformat().replace('.%06d' % micro, '.' + ('%06d' % micro).rstrip('0'))
+            task = {'status': 'failed', 'attempts': 1, 'updated_at': stamp}
+            self.assertIsNone(claim_blocker({'tasks': {'download': task}}), stamp)
+
     def test_db_attempt_backoff_and_active_lease_are_not_forced(self):
         from datetime import datetime, timezone, timedelta
         now = datetime.now(timezone.utc)

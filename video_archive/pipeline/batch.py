@@ -424,6 +424,8 @@ async def process_batch(db, storage, cache, store, client, peer, source, jobs, *
                 return
             # One import for both lines; it also backfills the two cover task rows.
             await threaded(db.call, 'import_video', d, v)
+            # A legacy Supabase row is re-streamed from scratch; for any other row this is a no-op.
+            await threaded(db.call, 'begin_restream', v['id'])
         except asyncio.CancelledError:
             item['result'] = item['cover_result'] = 'interrupted'
             raise

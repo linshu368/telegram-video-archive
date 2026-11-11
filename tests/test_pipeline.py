@@ -23,7 +23,7 @@ from video_archive.pipeline.runner import archive_existing, download_task, main,
 from video_archive.pipeline.cache import Cache, archived_local
 from video_archive.pipeline.common import (BASE, PipelineError, ai_output, config, cover_object_path,
                              covers_committed, display, error_code, identity, object_path,
-                             snapshot)
+                             snapshot, video_committed)
 from video_archive.pipeline.db import Database, Lease
 from video_archive.pipeline.storage import CHUNK, COVER_LIMIT, COVERS, Storage
 from test_archive import FakeClient, SOURCE, message
@@ -609,6 +609,7 @@ class PostgresTests(unittest.TestCase):
         legacy = cls.owner.execute('SELECT drama_archive.video_state(%s)', (legacy_video['id'],)).fetchone()[0]
         if legacy['storage_provider'] != 'supabase' or 'stream_process' in legacy['tasks']:
             raise AssertionError('migration changed an existing video')
+        cls.owner.execute((BASE / 'migrations/010_restream_legacy.sql').read_text())
         cls.db = Database(cls.dsn + " options='-c role=drama_worker'")
         cls.login = 'drama_test_' + uuid.uuid4().hex[:12]
         cls.owner.execute(psycopg.sql.SQL('CREATE ROLE {} LOGIN NOSUPERUSER NOBYPASSRLS').format(
@@ -1076,7 +1077,7 @@ class PostgresTests(unittest.TestCase):
             cache.put(self.vid, path=str(video_path), size=video_path.stat().st_size,
                       sha256=sha256(video_path))
             rows = [(self.d, self.v, {'message_id': int(self.v['message_id'])}, {})]
-            candidates = select_ai_candidates(rows, self.db.archived_messages())
+            candidates = select_ai_candidates(rows, {int(self.v['message_id'])})
             self.assertEqual([v['id'] for _, v, _, _ in candidates], [self.vid])
             provider = Provider({'frame_count': 2, 'max_dim': 64})
             with patch('video_archive.pipeline.ai.call_model', return_value={
@@ -1133,13 +1134,101 @@ class PostgresTests(unittest.TestCase):
     def test_archived_messages_function_is_restricted_and_reports_commits(self):
         self.assertEqual(self.db.archived_messages(), set())
         self.uploaded()
-        self.assertEqual(self.db.archived_messages(), {int(self.v['message_id'])})
+        # A Supabase file is legacy: re-streamed from scratch, so it is not "archived".
+        self.assertEqual(self.db.archived_messages(), set())
+        self.assertEqual(self.db.legacy_messages(), {int(self.v['message_id'])})
         for role in ('anon', 'authenticated', 'service_role'):
             if self.owner.execute('SELECT 1 FROM pg_roles WHERE rolname=%s', (role,)).fetchone():
                 self.assertFalse(self.owner.execute(
                     "SELECT has_function_privilege(%s,'drama_archive.archived_messages()','EXECUTE')",
                     (role,)).fetchone()[0])
         self.assertTrue(self.worker.verify_worker()['restricted_login'])
+
+    def restream_stream_ready(self, vid, uid):
+        self.assertTrue(self.db.call('begin_restream', vid))
+        token = self.db.claim(vid, 'download')
+        self.assertIsNotNone(token)
+        self.db.call('finish', vid, 'download', token)
+        token = self.db.claim(vid, 'upload')
+        self.assertTrue(self.db.call('stream_create_intent', vid, token, True))
+        self.db.call('finish', vid, 'upload', token, {'uid': uid, 'source_bytes': 30, 'source_sha256': 'a' * 64})
+        token = self.db.claim(vid, 'stream_process')
+        self.db.call('finish', vid, 'stream_process', token, {
+            'uid': uid, 'state': 'ready', 'pctComplete': 100, 'readyToStream': True, 'requireSignedURLs': True})
+
+    def raw_video(self, vid):
+        return self.owner.execute(
+            'SELECT storage_provider,object_path,stream_uid,stream_ready_at IS NOT NULL FROM drama_archive.videos WHERE id=%s',
+            (vid,)).fetchone()
+
+    def test_restream_keeps_old_file_until_whole_drama_is_on_stream(self):
+        second = fixture(6559)[1]
+        self.db.call('import_video', self.d, second)
+        self.uploaded()
+        self.complete_for(second['id'])
+        a, b = self.vid, second['id']
+        old = (('supabase', object_path(a), None, False), ('supabase', object_path(b), None, False))
+        self.assertEqual((self.raw_video(a), self.raw_video(b)), old)
+        self.assertEqual(self.db.archived_messages(), set())
+        self.restream_stream_ready(a, 'aa' * 16)
+        # Re-streaming is invisible to the App: the row still plays its old file.
+        self.assertEqual(self.raw_video(a)[:3], ('supabase', object_path(a), None))
+        state = self.db.state(a)
+        self.assertEqual((state['storage_provider'], state['object_path'], state['stream_uid']),
+                         ('cloudflare_stream', None, 'aa' * 16))
+        self.assertEqual(self.db.archived_messages(), {int(self.v['message_id'])})
+        self.assertEqual(self.db.legacy_messages(), {6558, 6559})
+        self.restream_stream_ready(b, 'bb' * 16)
+        # The last episode switches the whole drama in one transaction.
+        self.assertEqual(self.raw_video(a), ('cloudflare_stream', None, 'aa' * 16, True))
+        self.assertEqual(self.raw_video(b), ('cloudflare_stream', None, 'bb' * 16, True))
+        self.assertEqual(self.db.archived_messages(), {6558, 6559})
+        self.assertEqual(self.db.legacy_messages(), set())
+        self.assertTrue(video_committed(self.db.state(a), a))
+        self.assertFalse(self.db.call('begin_restream', a))
+
+    def complete_for(self, vid):
+        for stage, payload in (('download', {}), ('upload', {'object_path': object_path(vid)})):
+            self.db.call('finish', vid, stage, self.db.claim(vid, stage, backoff=0), payload)
+
+    def test_restream_does_not_switch_drama_with_unstarted_sibling(self):
+        second = fixture(6559)[1]
+        self.db.call('import_video', self.d, second)
+        self.uploaded()
+        self.complete_for(second['id'])
+        self.restream_stream_ready(self.vid, 'aa' * 16)
+        self.assertEqual(self.raw_video(self.vid)[:3], ('supabase', object_path(self.vid), None))
+        self.assertEqual(self.raw_video(second['id'])[:2], ('supabase', object_path(second['id'])))
+
+    def test_restream_ignores_unfinished_and_stream_rows(self):
+        self.assertFalse(self.db.call('begin_restream', self.vid))  # imported, never uploaded
+        self.uploaded()
+        self.assertTrue(self.db.call('begin_restream', self.vid))
+        self.assertFalse(self.db.call('begin_restream', self.vid))  # already marked
+        self.assertEqual(self.db.call('claim', self.vid, 'transcode', 120, 5, 0), None)
+        state = self.db.state(self.vid)
+        self.assertEqual((state['tasks']['download']['status'], state['tasks']['upload']['status'],
+                          state['tasks']['stream_process']['status']), ('pending',) * 3)
+
+    def test_restream_ai_waits_for_ready_stream_video(self):
+        self.uploaded()
+        self.assertEqual(str(self.db.call('ai_source_video', self.d['id'])), self.vid)
+        self.db.call('begin_restream', self.vid)
+        self.assertIsNone(self.db.call('ai_source_video', self.d['id']))
+        self.assertIsNone(self.db.claim(self.d['id'], 'ai'))
+
+    def test_restream_worker_contract_tolerates_app_objects_without_worker_access(self):
+        owner = self.owner
+        owner.execute("CREATE TABLE drama_archive.drama_likes(drama_id uuid)")
+        owner.execute("ALTER TABLE drama_archive.drama_likes ENABLE ROW LEVEL SECURITY")
+        owner.execute("CREATE FUNCTION drama_archive.create_drama_comment(p uuid) RETURNS void LANGUAGE sql AS 'SELECT'")
+        owner.execute("REVOKE ALL ON FUNCTION drama_archive.create_drama_comment(uuid) FROM PUBLIC")
+        self.addCleanup(owner.execute, "DROP TABLE IF EXISTS drama_archive.drama_likes")
+        self.addCleanup(owner.execute, "DROP FUNCTION IF EXISTS drama_archive.create_drama_comment(uuid)")
+        self.assertTrue(self.worker.verify_worker()['restricted_login'])
+        owner.execute("GRANT EXECUTE ON FUNCTION drama_archive.create_drama_comment(uuid) TO drama_worker")
+        with self.assertRaisesRegex(PipelineError, 'worker_function_privileges_conflict'):
+            self.worker.verify_worker()
 
     def test_drama_plan_order_and_cloud_completion(self):
         from video_archive.pipeline.batch import plan_dramas
@@ -1236,14 +1325,20 @@ class PostgresTests(unittest.TestCase):
             self.assertEqual(covers_committed(tmp, 'b' * 20), set())
             with self.assertRaisesRegex(PipelineError, 'cover_project_ref_required'):
                 covers_committed(tmp, None)
-            # Rerun: nothing downloaded or uploaded again, on either track.
+            # Rerun: Supabase rows are legacy now. They re-enter as Stream rows (Stream is not
+            # configured here, so intake stops) and the old object is never re-uploaded or touched.
             report = asyncio.run(process_batch(self.db, storage, cache, store, client, None, SOURCE, jobs,
                                                concurrency=2, report_path=report_path,
                                                project_ref=PROJECT))
-            self.assertEqual((client.downloads, storage.posts), (4, 4))
-            self.assertEqual((client.thumb_downloads, storage.cover_posts), (4, 4))
-            self.assertEqual(report['cover_counts'], {'already_archived': 4})
-            self.assertEqual(report['status'], 'all_archived')
+            self.assertEqual(storage.posts, 4)
+            self.assertEqual(report['stop_reason'], 'private_stream_config_missing')
+            marked = 0
+            for _, v, _, _ in jobs:
+                raw = self.owner.execute('SELECT storage_provider,object_path,restream_at FROM drama_archive.videos WHERE id=%s',
+                                         (v['id'],)).fetchone()
+                self.assertEqual(raw[:2], ('supabase', object_path(v['id'])))
+                marked += raw[2] is not None
+            self.assertGreaterEqual(marked, 1)  # intake stops at the first Stream failure
             store.db.close()
 
     @unittest.skipUnless((BASE / 'archive/state.sqlite3').exists(), 'optional existing local inventory')

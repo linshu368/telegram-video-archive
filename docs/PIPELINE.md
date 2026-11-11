@@ -10,13 +10,15 @@
 
 **上线顺序**。确认目标库已应用 001 到 008，在切换 worker 前停止旧 worker，再为该库单独应用 `migrations/009_cloudflare_stream.sql`。新 worker 校验数据库函数契约。迁移保留所有既有行（包括尚未上传的行）的 `supabase` 标记，之后首次导入的行使用 `cloudflare_stream`。同一集的扫描、补齐和重试沿用首次选择。
 
+**存量重传（010）**。已有的 supabase 视频没有经过画质筛选，按"不存在"处理：`archived_messages()` 只认 Stream 已就绪的行，存量行因此重新走筛选，通过的剧在 `batch` 里经 `begin_restream` 重置 download/upload 并重新下载、上传到 Stream。重传期间该行仍是 `supabase` 加 `object_path`，App 照常播放旧文件；`video_state` 把它按 Stream 行汇报，worker 不需要额外分支。同一部剧的最后一集 `stream_process` 就绪时，在同一个事务里把整部剧所有行切成 `cloudflare_stream`（写 `stream_uid`、`stream_ready_at`，`object_path` 置空），App 永远看不到半切换的剧。没通过筛选的剧不进入重传，存量行原样保留。旧文件不删除，路径恒为 `videos/<id>/original`，单行回滚的 SQL 见迁移头部注释。`legacy_messages()` 返回仍在 Supabase 的存量消息，文字结构化据此全部跳过。应用顺序：009 → 010，且 App 已支持按 `stream_uid` 播放之后再开始重传。`verify_worker` 容忍 App 自有的 `drama_comments`、`drama_likes`、`create_drama_comment`，但要求 worker 对它们没有任何权限。
+
 **配置**。按 `config/examples/cloudflare.example.json` 准备 `.private/cloudflare.json`，填入开通 Stream 的账户 ID 和对该账户具备 Stream 读写权限的 API token。私有目录权限为 0700，文件为 0600。此文件只用于归档 API；App 的播放签名私钥由消费端后端保管。Telegram 封面仍使用原 Supabase 封面桶。
 
 **验收**。上传完成后，`pipeline_tasks` 的 `upload` 行保存临时 UID、已校验原片的字节数与 SHA-256。此时 `videos.stream_uid` 仍为空。`stream_process` 核对远端 UID、项目、内部视频身份和私有标记；当 `status.state=ready`、`readyToStream=true`、`status.pctComplete=100` 同时成立，事务写入 `videos.stream_uid`、`stream_ready_at` 并完成任务。报告中的 `stream_processing` 是待完成，即使只剩一集也不能当作最终缺集。每次领取最多轮询约五分钟，正常等待不消耗失败次数。后续补齐轮次或再次运行 `run`、`repair` 会继续查询同一 UID。只有 `stream_ready` 后，`--cleanup` 才可清理已验证的本地原片。AI 优先读取原片；已清理时，归档 worker 为 AI 临时获取私有 Stream 输入，用于抽帧和转录。
 
 **恢复**。DB 在发出 TUS 创建请求前记录创建意图。Stream 资产的 creator 包含项目和内部视频 ID，meta 同时记录这两项与源 SHA-256。已知 TUS 地址时按远端 offset 续传。创建响应丢失时，使用 creator 查找并核对唯一匹配的资产。若没有唯一匹配，或只找到未传完的资产且续传地址已丢失，任务留在 `stream_reconciliation_pending`，保留本地文件。处理这类记录时先在相同账户核对 creator、meta、上传会话和状态。
 
-**App 对接**。按 `videos.storage_provider` 分支。旧视频使用原 `object_path`；新视频只有正式 `stream_uid`、`stream_ready_at` 存在时才可展示为可播放。新资产要求签名。在返回剧集详情时，App 后端用本地保存的签名私钥生成短期播放地址；客户端直接使用返回的地址。签名私钥只保存在 App 服务端。具体 HLS 播放实现由消费端负责。
+**App 对接**。按 `videos.storage_provider` 分支。旧视频使用原 `object_path`（存量重传完成前）；新视频只有正式 `stream_uid`、`stream_ready_at` 存在时才可展示为可播放。新资产要求签名。在返回剧集详情时，App 后端用本地保存的签名私钥生成短期播放地址；客户端直接使用返回的地址。签名私钥只保存在 App 服务端。具体 HLS 播放实现由消费端负责。
 
 视频的 `episode` 是文本字段。显式「集数」标签优先；「第十二集」「EP12」「12集」等单集标记统一写入 `12`。缺少标记、出现互相矛盾的集号或仅描述合集范围时留空。剧与频道的归属仍取自 Telegram 话题。
 

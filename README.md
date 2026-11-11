@@ -22,7 +22,7 @@
 python pipeline.py run --drama-concurrency 2 --concurrency 4
 ```
 
-默认依次进行：**完整源元数据扫描 → 整剧画质筛选 → 按剧下载补齐 → 私有上传与转码就绪验收 → 合格剧 AI 生成并事务回写 → 封面验收与封存**。源扫描只读取信息，不下载视频或封面。已有 Supabase 视频继续使用原对象。Stream 配置、迁移顺序及 App 字段见[流程与操作](docs/PIPELINE.md#cloudflare-stream)。需要复用已有有效完整扫描时，显式使用 `run --skip-scan`。
+默认依次进行：**完整源元数据扫描 → 整剧画质筛选 → 按剧下载补齐 → 私有上传与转码就绪验收 → 合格剧 AI 生成并事务回写 → 封面验收与封存**。源扫描只读取信息，不下载视频或封面。已有 Supabase 视频在重传到 Stream 之前继续使用原对象，进入流程时按"不存在"处理，见[存量重传](docs/PIPELINE.md#cloudflare-stream)。Stream 配置、迁移顺序及 App 字段见[流程与操作](docs/PIPELINE.md#cloudflare-stream)。需要复用已有有效完整扫描时，显式使用 `run --skip-scan`。
 
 一部剧以 Telegram 原始话题在扫描边界内可访问的全部视频为准。信息不完整的剧暂缓；包含横屏或方屏的剧排除；其余按既定分辨率和码率标准判断。合格剧的成员完整保留，少量画质异常只影响评分。具体规则见 [整剧筛选说明](docs/PIPELINE.md)。
 

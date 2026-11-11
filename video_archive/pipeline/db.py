@@ -9,6 +9,15 @@ from psycopg.types.json import Jsonb
 from video_archive.pipeline.common import PipelineError, error_code
 
 
+WORKER_FUNCTIONS = frozenset({
+    'import_video', 'video_state', 'archived_messages', 'claim', 'renew', 'finish', 'fail',
+    'regenerate_ai', 'regenerate_transcode', 'ai_source_video', 'stream_create_intent',
+    'begin_restream', 'legacy_messages'})
+# Owned by the App (drama interactions). Tolerated in the schema, but the worker must not touch them.
+APP_TABLES = frozenset({'drama_comments', 'drama_likes'})
+APP_FUNCTIONS = frozenset({'create_drama_comment'})
+
+
 class Database:
     # Pooled Supavisor sessions refuse bursts of new connections; bound them per process.
     slots = threading.BoundedSemaphore(4)
@@ -54,7 +63,8 @@ class Database:
                 FROM pg_class c JOIN pg_namespace n ON n.oid=c.relnamespace
                 WHERE n.nspname='drama_archive' AND c.relkind IN ('r','p','v','m','f')
             """).fetchall()
-            if {r[1] for r in tables} != {'dramas', 'videos', 'ai_results', 'pipeline_tasks', 'drama_tasks'}:
+            if {r[1] for r in tables} - APP_TABLES != {
+                    'dramas', 'videos', 'ai_results', 'pipeline_tasks', 'drama_tasks'}:
                 raise PipelineError('business_schema_conflict')
             if any(not r[2] or r[4] or db.execute(
                     "SELECT pg_has_role(current_user,%s,'MEMBER')", (r[3],)).fetchone()[0] for r in tables):
@@ -67,11 +77,14 @@ class Database:
                 FROM pg_proc p JOIN pg_namespace n ON n.oid=p.pronamespace
                 WHERE n.nspname='drama_archive'
             """).fetchall()
-            if len(funcs) != 11 or {r[1] for r in funcs} != {
-                    'import_video', 'video_state', 'archived_messages', 'claim', 'renew', 'finish', 'fail',
-                    'regenerate_ai', 'regenerate_transcode', 'ai_source_video', 'stream_create_intent'}:
+            if {r[1] for r in funcs} - APP_FUNCTIONS != WORKER_FUNCTIONS or len(funcs) != len(
+                    {r[1] for r in funcs}):
                 raise PipelineError('worker_function_contract_conflict')
-            for _, _, definer, settings, owner, execute, public in funcs:
+            for _, name, definer, settings, owner, execute, public in funcs:
+                if name in APP_FUNCTIONS:
+                    if execute or public:
+                        raise PipelineError('worker_function_privileges_conflict')
+                    continue
                 if (not definer or settings != ['search_path=pg_catalog, drama_archive']
                         or not execute or public or db.execute(
                             "SELECT pg_has_role(current_user,%s,'MEMBER')", (owner,)).fetchone()[0]):
@@ -80,19 +93,20 @@ class Database:
                     'direct_table_access': False}
 
     def connect(self):
-        """Retry only the connection attempt: nothing has been sent, so it is idempotent."""
-        for attempt in range(4):
+        """Retry only the connection attempt: nothing has been sent, so it is idempotent.
+
+        The pooler drops connections in bursts, so the window must outlast a burst (~75s in total).
+        """
+        for attempt in range(8):
             try:
                 return psycopg.connect(self.dsn, connect_timeout=15)
             except psycopg.OperationalError:
-                if attempt == 3:
+                if attempt == 7:
                     raise
-                time.sleep(2 ** attempt)
+                time.sleep(min(2 ** attempt, 15))
 
     def call(self, name, *args):
-        allowed = {'import_video', 'video_state', 'archived_messages', 'claim', 'renew', 'finish', 'fail',
-                   'regenerate_ai', 'regenerate_transcode', 'ai_source_video', 'stream_create_intent'}
-        if name not in allowed:
+        if name not in WORKER_FUNCTIONS:
             raise PipelineError('invalid_database_operation')
         slots = self.heartbeat_slots if name == 'renew' else self.slots
         with slots, self.connect() as db:
@@ -103,6 +117,10 @@ class Database:
     def archived_messages(self):
         """Message ids whose upload is committed, via restricted functions only."""
         return {int(m) for m in self.call('archived_messages')}
+
+    def legacy_messages(self):
+        """Message ids still served from Supabase (including ones being re-streamed)."""
+        return {int(m) for m in self.call('legacy_messages')}
 
     def state(self, vid):
         return self.call('video_state', vid)

@@ -101,6 +101,37 @@ class StreamTests(unittest.TestCase):
         with patch('video_archive.pipeline.stream.time.monotonic', side_effect=[0, 301]):
             self.assertIsNone(self.client.wait_ready(self.vid, self.upload, lambda: None))
 
+    def test_gateway_upload_url_is_accepted_only_for_this_account_media_path(self):
+        acct, host = 'b1' * 16, 'edge-production.gateway.api.cloudflare.com'
+        good = f'https://{host}/client/v4/accounts/{acct}/media/{self.uid}?tusv2=true'
+        seen = []
+
+        class Opener:
+            def open(self, request, timeout=None):
+                seen.append(request)
+                return Mock()
+
+        self.client.opener = Opener()
+        self.client.request('HEAD', good, {'Tus-Resumable': '1.0.0'})
+        # The gateway endpoint is authenticated like the API itself.
+        self.assertEqual(seen[0].headers['Authorization'], 'Bearer test')
+        # ... but a legacy upload host never receives the API token.
+        self.client.request('HEAD', 'https://upload.videodelivery.net/tus/abc', {})
+        self.assertNotIn('Authorization', seen[1].headers)
+        seen.pop()
+        for bad in (
+                f'https://{host}/client/v4/accounts/{"c2" * 16}/media/{self.uid}',  # another account
+                f'https://{host}/client/v4/accounts/{acct}/media/{self.uid}/extra',
+                f'https://{host}/client/v4/accounts/{acct}/stream/{self.uid}',
+                f'https://{host}:8443/client/v4/accounts/{acct}/media/{self.uid}',
+                f'http://{host}/client/v4/accounts/{acct}/media/{self.uid}',
+                f'https://evil.{host}/client/v4/accounts/{acct}/media/{self.uid}',
+                f'https://{host}.evil.example/client/v4/accounts/{acct}/media/{self.uid}',
+                f'https://user@{host}/client/v4/accounts/{acct}/media/{self.uid}'):
+            with self.assertRaisesRegex(PipelineError, 'untrusted_stream_url'):
+                self.client.request('HEAD', bad, {})
+        self.assertEqual(len(seen), 1)
+
     def test_ai_fallback_requests_one_token_for_a_trusted_private_asset(self):
         asset = {**self.asset, 'playback': {'hls': f'https://customer-test.cloudflarestream.com/{self.uid}/manifest/video.m3u8'}}
         self.client.api = Mock(side_effect=[asset, {'token': 'signed.test.token'}])

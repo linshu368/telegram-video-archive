@@ -14,6 +14,7 @@ from video_archive.pipeline.storage import NoRedirect
 
 CHUNK = 8 * 1024**2
 UID = re.compile(r'[0-9a-f]{32}')
+UPLOAD_GATEWAY = 'edge-production.gateway.api.cloudflare.com'
 
 
 def stream_config(path=BASE / '.private/cloudflare.json'):
@@ -46,12 +47,19 @@ class Stream:
         api = url == self.base or url.startswith((self.base + '/', self.base + '?'))
         upload_host = (parts.hostname or '').split('.')
         if (parts.scheme != 'https' or parts.username or parts.password or parts.port or parts.fragment
-                or not (api or '.'.join(upload_host[-2:]) in ('videodelivery.net', 'cloudflarestream.com'))):
+                or not (api or '.'.join(upload_host[-2:]) in ('videodelivery.net', 'cloudflarestream.com')
+                        or self.is_account_upload(parts))):
             raise PipelineError('untrusted_stream_url')
         headers = dict(headers or {})
-        if api:
+        # The gateway upload endpoint is Cloudflare's authenticated API: same token, account-pinned path only.
+        if api or self.is_account_upload(parts):
             headers['Authorization'] = 'Bearer ' + self.token
         return self.opener.open(Request(url, data=data, headers=headers, method=method), timeout=60)
+
+    def is_account_upload(self, parts):
+        """Cloudflare's gateway TUS endpoint (authenticated like the API): exactly this host, only this account's media path."""
+        return (parts.hostname == UPLOAD_GATEWAY
+                and re.fullmatch(rf'/client/v4/accounts/{self.account}/media/[0-9a-f]{{32}}', parts.path) is not None)
 
     def api(self, suffix, method='GET'):
         try:

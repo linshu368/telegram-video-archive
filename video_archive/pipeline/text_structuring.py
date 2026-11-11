@@ -10,7 +10,7 @@ from pathlib import Path
 
 from video_archive.core import atomic_json
 from video_archive.pipeline.ai import record_model_usage, strip_fence
-from video_archive.pipeline.common import BASE, PipelineError, error_code, tags, text
+from video_archive.pipeline.common import BASE, PipelineError, duration_seconds, error_code, tags, text
 
 PROMPT_PATH = BASE / 'prompts/text_structuring.md'
 MAX_BUNDLE_CHARS = 60_000
@@ -65,8 +65,13 @@ def validate_structure(bundle, value):
     if (any(type(n) is not int or not 1 <= n <= 999999 for n in numbers)
             or len(numbers) != len(set(numbers))):
         raise PipelineError(INVALID)
+    episodes = {x['message_id']: x['episode'] for x in videos}
+    if all(ep is None for ep in episodes.values()):
+        # No caption carries any episode evidence (empty captions): a one-video drama is episode 1 and a
+        # multi-video drama follows channel order. Partial evidence is never completed by guessing.
+        episodes = {mid: n for n, mid in enumerate(sorted(episodes), 1)}
     return {'title': text(drama['title']), 'description': text(drama['description']),
-            'tags': tags(drama['tags']), 'episodes': {x['message_id']: x['episode'] for x in videos}}
+            'tags': tags(drama['tags']), 'episodes': episodes}
 
 
 def call_structuring(bundle, cfg, check):
@@ -150,9 +155,13 @@ def structure_jobs(jobs, *, cfg, cache_path, skip_message_ids=(), check=lambda: 
             Path(cache_path).parent.mkdir(mode=0o700, parents=True, exist_ok=True)
             atomic_json(cache_path, cache)
             entry['result'] = 'structured'
-        for _, video, record, _ in members:
+        entry['videos'] = []
+        for _, video, record, _ in sorted(members, key=lambda job: job[2]['message_id']):
             episode = result['episodes'][record['message_id']]
             video.update(original_title=result['title'], original_description=result['description'],
                          original_tags=list(result['tags']),
                          episode=str(episode) if episode is not None else None)
+            # duration_seconds already rides on the snapshot video dict; reported here for review only.
+            entry['videos'].append({'message_id': record['message_id'], 'episode': episode,
+                                    'duration_seconds': duration_seconds(record)})
     return report

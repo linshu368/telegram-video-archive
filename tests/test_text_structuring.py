@@ -55,6 +55,27 @@ class ValidateTests(unittest.TestCase):
         self.assertEqual((result['title'], result['description'], result['tags']), ('剧名', None, ['a']))
         self.assertEqual(result['episodes'], {100: 1, 101: 2, 102: None})
 
+    def test_single_video_drama_is_episode_one_but_never_overrides_a_stated_number(self):
+        def one(episode):
+            bundle = build_bundle('话题', jobs(texts=('',)))
+            value = good(bundle)
+            value['videos'][0]['episode'] = episode
+            return validate_structure(bundle, value)['episodes']
+        self.assertEqual((one(None), one(5)), ({100: 1}, {100: 5}))
+
+    def test_multi_video_drama_without_any_number_follows_message_order(self):
+        bundle = build_bundle('话题', jobs(texts=('', '', '')))
+        value = good(bundle)
+        for item in value['videos']:
+            item['episode'] = None
+        self.assertEqual(validate_structure(bundle, value)['episodes'], {100: 1, 101: 2, 102: 3})
+
+    def test_partial_episode_evidence_is_never_completed_by_guessing(self):
+        bundle = build_bundle('话题', jobs(texts=('第1集', '', '')))
+        value = good(bundle)
+        value['videos'][0]['episode'], value['videos'][1]['episode'] = 1, None
+        self.assertEqual(validate_structure(bundle, value)['episodes'], {100: 1, 101: None, 102: None})
+
     def test_rejects_bad_shapes(self):
         def mutated(fn):
             value = good(self.bundle)
@@ -116,6 +137,25 @@ class StructureJobsTests(unittest.TestCase):
         self.assertEqual({v['original_description'] for v in videos}, {'简介'})
         self.assertEqual({tuple(v['original_tags']) for v in videos}, {('甜宠',)})
         self.assertEqual([v['episode'] for v in videos], ['1', '2', None])
+
+    def test_duration_comes_from_the_source_record_not_the_model(self):
+        rows = jobs()
+        rows[0][2]['duration_seconds'] = 54.4744
+        rows[1][2]['duration_seconds'] = 0  # not a usable duration
+        seen = []
+
+        def spy(bundle, cfg, check):
+            seen.append(json.dumps(bundle, ensure_ascii=False))
+            return good(bundle)
+        report = self.run_jobs(rows, spy)
+        self.assertEqual([x['duration_seconds'] for x in report[0]['videos']], [54.474, None, None])
+        self.assertEqual([x['message_id'] for x in report[0]['videos']], [100, 101, 102])
+        self.assertNotIn('duration', seen[0])
+        again = jobs()
+        again[2][2]['duration_seconds'] = 269.089
+        cached = self.run_jobs(again, spy)  # a cache hit still reports the current source duration
+        self.assertEqual(cached[0]['result'], 'cached')
+        self.assertEqual([x['duration_seconds'] for x in cached[0]['videos']], [None, None, 269.089])
 
     def test_cache_prevents_second_call_and_survives_json_roundtrip(self):
         first = Completion()

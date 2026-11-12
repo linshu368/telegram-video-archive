@@ -492,7 +492,8 @@ def main():
     parser.add_argument('--concurrency', type=int, default=4, choices=range(1, 9))
     parser.add_argument('--transcode-concurrency', type=int, default=2, choices=range(1, 5),
                         help=argparse.SUPPRESS)
-    parser.add_argument('--cleanup', action='store_true', help='batch: delete local file after verified cloud commit')
+    parser.add_argument('--cleanup', action='store_true', help='batch/run/ai: delete local file after verified cloud commit; '
+                                                                    "a drama's AI source episode is kept until its AI succeeds")
     parser.add_argument('--cache-high-gb', type=int, default=10, choices=range(1, 41))
     args = parser.parse_args()
     for name in ('config', 'data', 'topics', 'report'):
@@ -763,7 +764,8 @@ def main():
                     report['workflow_status'] = 'enriching'
                     atomic_json(path, report)
                     ai_report = process_ai(db, storage, cache, selected_rows, analyze=run_ai,
-                                           provider=provider, report_path=ai_path)
+                                           provider=provider, report_path=ai_path,
+                                           cleanup=args.cleanup)
                     report['ai_called'] = any(entry['result'] == 'ai_succeeded'
                                               for entry in ai_report['results'])
                     completed = finalize_processed(db, selected_rows, path=pool_path,
@@ -817,7 +819,7 @@ def main():
                 cache = Cache(args.data, project_ref=c['project_ref'])
                 ai_path = args.data / ('pipeline-ai-' + now().replace(':', '-') + '.json')
                 ai_report = process_ai(db, storage, cache, approved_rows, analyze=run_ai,
-                                       limit=args.limit, report_path=ai_path)
+                                       limit=args.limit, report_path=ai_path, cleanup=args.cleanup)
                 finalized = finalize_processed(db, approved_rows, path=pool_path,
                                                project_ref=c['project_ref'], report_path=ai_path)
                 print(json.dumps({**ai_report, 'processed_results': finalized, 'report': str(ai_path)}))

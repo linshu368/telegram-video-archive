@@ -13,6 +13,7 @@ import unittest
 import uuid
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import Mock, patch
 from urllib.error import HTTPError, URLError
 
@@ -703,45 +704,80 @@ class PostgresTests(unittest.TestCase):
         self.complete('ai', {'tags': [], 'source_video_id': vid})
         self.assertEqual(self.db.state(vid)['tasks']['ai']['status'], 'succeeded')
 
-    def test_stream_batch_resumes_encoding_without_copying_media_again(self):
+    def stream_batch(self, tmp, uid, **options):
+        """One Stream episode through process_batch(cleanup=True); run() repeats the pass."""
         import subprocess
         from video_archive.pipeline.batch import process_batch
+        store = Store(tmp)
+        self.addCleanup(store.db.close)
+        src = Path(tmp) / 'fixture.mp4'
+        subprocess.run(['ffmpeg', '-nostdin', '-v', 'error', '-f', 'lavfi', '-i',
+                        'color=s=64x64:d=0.2', '-c:v', 'mpeg4', str(src)], check=True)
+        data = src.read_bytes()
+        msg = message(901, len(data), name='901.mp4')
+        record = record_message(msg, SOURCE)
+        store.ingest([record], 902, 901, [901])
+        drama, video = fixture(901, source=SOURCE['id'])
+        video['media_id'] = str(record['media_id'])
+        jobs = [(drama, video, record, next(iter(store.videos()))[1])]
+        cache = Cache(tmp, project_ref=PROJECT)
+        telegram = FakeClient([msg], data)
+        storage = Mock()
+        storage.upload_cover.return_value = 'cover-receipt'
+        ready = {'uid': uid, 'state': 'ready', 'readyToStream': True, 'pctComplete': 100, 'requireSignedURLs': True}
+        def run():
+            return asyncio.run(process_batch(self.db, storage, cache, store, telegram, None, SOURCE, jobs,
+                                             cleanup=True, project_ref=PROJECT, **options))['videos'][0]
+        return SimpleNamespace(run=run, ready=ready, drama=drama, video=video, record=record,
+                               telegram=telegram, storage=storage,
+                               local=Path(tmp) / 'videos' / filename(record))
+
+    def test_stream_batch_resumes_encoding_without_copying_media_again(self):
         with tempfile.TemporaryDirectory() as tmp:
-            store = Store(tmp)
-            self.addCleanup(store.db.close)
-            src = Path(tmp) / 'fixture.mp4'
-            subprocess.run(['ffmpeg', '-nostdin', '-v', 'error', '-f', 'lavfi', '-i',
-                            'color=s=64x64:d=0.2', '-c:v', 'mpeg4', str(src)], check=True)
-            data = src.read_bytes()
-            msg = message(901, len(data), name='901.mp4')
-            record = record_message(msg, SOURCE)
-            store.ingest([record], 902, 901, [901])
-            drama, video = fixture(901, source=SOURCE['id'])
-            video['media_id'] = str(record['media_id'])
-            jobs = [(drama, video, record, next(iter(store.videos()))[1])]
-            cache = Cache(tmp, project_ref=PROJECT)
-            telegram = FakeClient([msg], data)
-            storage = Mock()
-            storage.upload_cover.return_value = 'cover-receipt'
             uid = 'a9'*16
-            ready = {'uid': uid, 'state': 'ready', 'readyToStream': True, 'pctComplete': 100, 'requireSignedURLs': True}
+            case = self.stream_batch(tmp, uid)
+            video, record, telegram, storage = case.video, case.record, case.telegram, case.storage
             with patch('video_archive.pipeline.batch.stream_config'), patch('video_archive.pipeline.runner.Stream') as client:
                 client.return_value.upload.return_value = uid
-                client.return_value.wait_ready.side_effect = [None, ready]
-                def run():
-                    return asyncio.run(process_batch(self.db, storage, cache, store, telegram,
-                                                     None, SOURCE, jobs, cleanup=True, project_ref=PROJECT))
-                waiting = run()['videos'][0]
+                client.return_value.wait_ready.side_effect = [None, case.ready]
+                run = case.run
+                waiting = run()
                 self.assertEqual(waiting['result'], 'stream_processing', waiting)
-                self.assertTrue((Path(tmp) / 'videos' / filename(record)).is_file())
+                self.assertTrue(case.local.is_file())
                 self.assertIsNone(self.db.state(video['id'])['stream_uid'])
-                ready_entry = run()['videos'][0]
+                ready_entry = run()
                 self.assertEqual(ready_entry['result'], 'stream_ready', ready_entry)
                 self.assertEqual(ready_entry['stream_uid'], uid)
                 self.assertTrue(ready_entry['local_cleaned'])
+                self.assertFalse(case.local.exists())
                 self.assertEqual(telegram.downloads, 1)
                 client.return_value.upload.assert_called_once()
                 storage.upload.assert_not_called()
+
+    def test_stream_batch_keeps_the_ai_source_original_until_the_drama_ai_succeeds(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            uid = 'b8'*16
+            case = self.stream_batch(tmp, uid, ai_source_message_ids=frozenset({901}))
+            with patch('video_archive.pipeline.batch.stream_config'), patch('video_archive.pipeline.runner.Stream') as client:
+                client.return_value.upload.return_value = uid
+                client.return_value.wait_ready.side_effect = [case.ready]
+                kept = case.run()
+                self.assertEqual(kept['result'], 'stream_ready', kept)
+                self.assertTrue(kept['local_retained_for_ai'])
+                self.assertNotIn('local_cleaned', kept)
+                self.assertTrue(case.local.is_file())
+                cache = Cache(tmp, project_ref=PROJECT)
+                with self.assertRaisesRegex(PipelineError, 'ai_not_succeeded'):
+                    cache.cleanup(case.video['id'], self.db, require_ai_success=True)
+                self.assertTrue(case.local.is_file())
+                token = self.db.claim(case.drama['id'], 'ai', backoff=0)
+                self.db.call('finish', case.drama['id'], 'ai', token,
+                             {'tags': [], 'source_video_id': case.video['id']})
+                # With the drama's AI committed, the next pass cleans it like any other episode.
+                cleaned = case.run()
+                self.assertTrue(cleaned['local_cleaned'], cleaned)
+                self.assertFalse(case.local.exists())
+                self.assertEqual(case.telegram.downloads, 1)
 
     def test_cover_stages_are_independent_of_the_video_stages(self):
         state = self.db.state(self.vid)

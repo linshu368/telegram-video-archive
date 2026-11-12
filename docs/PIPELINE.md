@@ -16,7 +16,7 @@
 
 **配置**。按 `config/examples/cloudflare.example.json` 准备 `.private/cloudflare.json`，填入开通 Stream 的账户 ID 和对该账户具备 Stream 读写权限的 API token。私有目录权限为 0700，文件为 0600。此文件只用于归档 API；App 的播放签名私钥由消费端后端保管。Telegram 封面仍使用原 Supabase 封面桶。
 
-**验收**。上传完成后，`pipeline_tasks` 的 `upload` 行保存临时 UID、已校验原片的字节数与 SHA-256。此时 `videos.stream_uid` 仍为空。`stream_process` 核对远端 UID、项目、内部视频身份和私有标记；当 `status.state=ready`、`readyToStream=true`、`status.pctComplete=100` 同时成立，事务写入 `videos.stream_uid`、`stream_ready_at` 并完成任务。报告中的 `stream_processing` 是待完成，即使只剩一集也不能当作最终缺集。每次领取最多轮询约五分钟，正常等待不消耗失败次数。后续补齐轮次或再次运行 `run`、`repair` 会继续查询同一 UID。只有 `stream_ready` 后，`--cleanup` 才可清理已验证的本地原片。AI 优先读取原片；已清理时，归档 worker 为 AI 临时获取私有 Stream 输入，用于抽帧和转录。
+**验收**。上传完成后，`pipeline_tasks` 的 `upload` 行保存临时 UID、已校验原片的字节数与 SHA-256。此时 `videos.stream_uid` 仍为空。`stream_process` 核对远端 UID、项目、内部视频身份和私有标记；当 `status.state=ready`、`readyToStream=true`、`status.pctComplete=100` 同时成立，事务写入 `videos.stream_uid`、`stream_ready_at` 并完成任务。报告中的 `stream_processing` 是待完成，即使只剩一集也不能当作最终缺集。每次领取最多轮询约五分钟，正常等待不消耗失败次数。后续补齐轮次或再次运行 `run`、`repair` 会继续查询同一 UID。只有 `stream_ready` 后，`--cleanup` 才可清理已验证的本地原片；每部剧最早的一集（`ai_source_video` 在整剧就绪时选中的 AI 源集）例外，原片保留到该剧 AI 成功后，由 `run`/`ai` 的 `--cleanup` 再清理。因为 AI 在整个 batch 之后才运行，一次 `run` 的剧数决定了同时留存的源集体量，需控制在 `--cache-high-gb` 以内。AI 优先读取原片；已清理时，归档 worker 为 AI 临时获取私有 Stream 输入，用于抽帧和转录。
 
 **恢复**。DB 在发出 TUS 创建请求前记录创建意图。Stream 资产的 creator 包含项目和内部视频 ID，meta 同时记录这两项与源 SHA-256。已知 TUS 地址时按远端 offset 续传。创建响应丢失时，使用 creator 查找并核对唯一匹配的资产。若没有唯一匹配，或只找到未传完的资产且续传地址已丢失，任务留在 `stream_reconciliation_pending`，保留本地文件。处理这类记录时先在相同账户核对 creator、meta、上传会话和状态。
 

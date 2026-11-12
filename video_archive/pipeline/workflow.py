@@ -91,8 +91,27 @@ def encoding_outstanding(db, members, committed):
     return False
 
 
-def process_ai(db, storage, cache, rows, *, analyze, provider=None, limit=None, report_path=None):
-    """Reuse the existing drama AI transaction; resume after success without paying twice."""
+def _cleanup_ai_source(db, cache, vid, entry):
+    """The batch keeps the AI source original until now; a failure here never fails the AI."""
+    vid = str(vid)
+    local = cache.get(vid)
+    if local.get('protected') or not local.get('path'):
+        return
+    try:
+        if not cache.path(local).exists():
+            return
+        cache.cleanup(vid, db, require_ai_success=True)
+        entry['local_cleaned'] = True
+    except Exception as exc:
+        entry['cleanup_error'] = error_code(exc)
+
+
+def process_ai(db, storage, cache, rows, *, analyze, provider=None, limit=None, report_path=None,
+               cleanup=False):
+    """Reuse the existing drama AI transaction; resume after success without paying twice.
+
+    cleanup: remove the AI source's local original once the drama's AI is committed.
+    """
     from video_archive.pipeline.batch import select_ai_drama_candidates
     from video_archive.pipeline.runner import committed_inventory, verify_identity
     rows = list(rows)
@@ -145,6 +164,8 @@ def process_ai(db, storage, cache, rows, *, analyze, provider=None, limit=None, 
                         entry.pop('error', None)
                 except Exception:
                     pass
+            if cleanup and entry['result'] in ('ai_succeeded', 'ai_already_succeeded'):
+                _cleanup_ai_source(db, cache, cloud['ai']['source_video_id'], entry)
             report['results'].append(entry)
             save()
         report['status'] = ('pending' if any(e['result'] not in (

@@ -90,6 +90,23 @@ class CompletionTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(failed_episode['video_status'], 'verified')
         self.assertEqual(evaluation['completion_identity_status'], 'matched_manifest')
 
+    async def test_ai_source_is_the_earliest_expected_member_even_for_retry_and_repair_subsets(self):
+        seen = []
+        def record(batch, options, attempt):
+            seen.append(options['ai_source_message_ids'])
+            return receipt(batch, failures={101, 149} if attempt == 1 else ())
+        _, calls = await self.execute(retry_rounds=1, handler=record)
+        self.assertEqual([len(batch) for batch in calls], [50, 2])
+        self.assertEqual(seen, [frozenset({101})] * 2)
+        # A later run that only schedules the tail still names the drama's first episode.
+        seen.clear()
+        committed = set(range(101, 150))
+        _, calls = await self.execute(name='repair', archived=committed, covered=committed,
+                                      handler=record, resume_partials=True, defer_ids=(),
+                                      force_readback=False)
+        self.assertEqual(calls, [[150]])
+        self.assertEqual(seen, [frozenset({101})])
+
     async def test_50_receipts_with_one_wrong_message_cannot_complete(self):
         def wrong(batch, *_):
             part = receipt(batch); part['videos'][-1]['message_id'] = 999

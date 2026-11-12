@@ -143,6 +143,36 @@ class StreamTests(unittest.TestCase):
             self.client.ai_media(self.uid)
         self.assertEqual(self.client.api.call_count, 1)
 
+    def test_process_ai_cleans_the_retained_source_only_after_ai_commits(self):
+        self.state.update(stream_uid=self.uid, stream_ready_at='2026-01-01T00:00:00Z')
+        self.state['tasks']['stream_process']['status'] = 'succeeded'
+        for state in self.db.states.values():
+            state['tasks']['ai'], state['ai'] = {'status': 'pending'}, None
+        with self.assertRaisesRegex(PipelineError, 'ai_not_succeeded'):
+            self.cache.cleanup(self.vid, self.db, require_ai_success=True)
+        self.assertTrue(self.path.exists())
+        failing = Mock(side_effect=PipelineError('ffprobe_failed'))
+        report = workflow.process_ai(self.db, None, self.cache, self.rows, analyze=failing,
+                                     provider=object(), cleanup=True)
+        self.assertEqual(report['results'][0]['result'], 'failed')
+        self.assertTrue(self.path.exists())
+        commit = Mock(side_effect=lambda *args, **kwargs: self.db.commit_ai())
+        report = workflow.process_ai(self.db, None, self.cache, self.rows, analyze=commit,
+                                     provider=object())
+        self.assertEqual(report['results'][0]['result'], 'ai_succeeded')
+        self.assertTrue(self.path.exists())
+        report = workflow.process_ai(self.db, None, self.cache, self.rows, analyze=commit,
+                                     provider=object(), cleanup=True)
+        self.assertEqual(report['results'][0], {'drama_id': self.rows[0][1]['drama_id'],
+                                                'result': 'ai_already_succeeded', 'local_cleaned': True})
+        self.assertFalse(self.path.exists())
+        self.assertEqual(commit.call_count, 1)
+        # Nothing left to clean: a rerun neither fails nor reports a cleanup.
+        report = workflow.process_ai(self.db, None, self.cache, self.rows, analyze=commit,
+                                     provider=object(), cleanup=True)
+        self.assertEqual(report['results'][0]['result'], 'ai_already_succeeded')
+        self.assertNotIn('local_cleaned', report['results'][0])
+
     def test_cache_ai_and_drama_gate_before_and_after_ready(self):
         with self.assertRaisesRegex(PipelineError, 'not_committed'):
             self.cache.cleanup(self.vid, self.db)

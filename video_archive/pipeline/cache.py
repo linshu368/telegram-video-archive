@@ -117,13 +117,15 @@ class Cache:
             with self.connect() as db:
                 db.execute('DELETE FROM reservations WHERE video_id=?', (str(vid),))
 
-    def cleanup(self, vid, database):
+    def cleanup(self, vid, database, require_ai_success=False):
         with self.lock(vid, blocking=False):
             entry, state = self.get(vid), database.state(vid)
             if entry.get('protected'):
                 raise PipelineError('protected_sample')
             if not video_committed(state, vid) or 'ai' not in state['tasks']:
                 raise PipelineError('archive_not_committed')
+            if require_ai_success and state['tasks']['ai']['status'] != 'succeeded':
+                raise PipelineError('ai_not_succeeded')
             if is_stream(state):
                 if state['tasks']['upload']['source_sha256'] != entry.get('sha256'):
                     raise PipelineError('stream_source_mismatch')

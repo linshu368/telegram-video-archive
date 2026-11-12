@@ -350,7 +350,11 @@ async def process_batch(db, storage, cache, store, client, peer, source, jobs, *
                         concurrency=4, cleanup=False, report_path=None, pause_wait=120,
                         download_timeout=1800, abort=None, project_ref=None, deferred=(),
                         resume_partials=False, cover_concurrency=2, cover_only=frozenset(),
-                        lifecycle_gate=None, shared_stop=None, flood_router=None):
+                        lifecycle_gate=None, shared_stop=None, flood_router=None,
+                        ai_source_message_ids=frozenset()):
+    """ai_source_message_ids: episodes whose original stays local until the drama's AI
+    succeeds (AI reads the original; the Stream fallback is unreliable on this network).
+    """
     states = {r['message_id']: s for r, s in store.videos()}
     stop = shared_stop if shared_stop is not None else asyncio.Event()
     abort = abort if abort is not None else threading.Event()
@@ -555,8 +559,12 @@ async def process_batch(db, storage, cache, store, client, peer, source, jobs, *
             active()
             entry = await threaded(cache.get, vid)
             if cleanup and not entry.get('protected') and entry.get('path'):
-                await threaded(cache.cleanup, vid, db)
-                item['local_cleaned'] = True
+                if mid in ai_source_message_ids and item['ai_status'] != 'succeeded':
+                    # process_ai(cleanup=True) removes it once the drama's AI commits.
+                    item['local_retained_for_ai'] = True
+                else:
+                    await threaded(cache.cleanup, vid, db)
+                    item['local_cleaned'] = True
         except asyncio.CancelledError:
             item['result'] = 'interrupted'
             raise
@@ -723,6 +731,11 @@ async def process_drama_pass(db, storage, cache, store, client, peer, source, jo
                           delivery_stopped=False, delivery_interrupted=False,
                           delivery_phase='queued' if evaluation.get('planning_status') == 'scheduled'
                                          else 'not_scheduled')
+    # ai_source_video() picks the earliest ready episode, so with the drama complete that is
+    # its earliest expected message -- not the earliest of a retry subset or a later segment.
+    ai_sources = {did: frozenset({min(by_drama[did].get('expected_message_ids')
+                                      or [job[2]['message_id'] for job in members])})
+                  for did, members in groups.items()}
     report_path = Path(report_path) if report_path else None
     shared_stop = asyncio.Event()
     abort = options.get('abort')
@@ -817,7 +830,8 @@ async def process_drama_pass(db, storage, cache, store, client, peer, source, jo
             save()
             part_options = {**options, 'cover_only': set(by_drama[did].get('cover_only_message_ids', [])),
                             'lifecycle_gate': lifecycle_gate, 'shared_stop': shared_stop,
-                            'flood_router': flood_router}
+                            'flood_router': flood_router,
+                            'ai_source_message_ids': ai_sources.get(did, frozenset())}
             if retry_round:
                 latest = {entry['message_id']: entry for part in report['segments']
                           for entry in part.get('videos', [])}
